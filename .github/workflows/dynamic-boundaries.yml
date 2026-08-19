@@ -1,0 +1,92 @@
+name: Dynamic Boundaries
+
+on:
+  schedule:
+    - cron: "17 3 * * 6"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NIGHTLY_TOOLCHAIN: nightly-2026-08-15
+
+jobs:
+  protocol-boundaries:
+    name: Bounded protocol mutation corpus
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # exact repository toolchain
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Run fixed-size mutation corpus
+        run: cargo test --locked --all-features --test dynamic_input_contract --release
+
+  protocol-fuzz:
+    name: Protocol libFuzzer and ASan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # pinned installer action
+        with:
+          toolchain: ${{ env.NIGHTLY_TOOLCHAIN }}
+          components: rust-src,llvm-tools-preview
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: protocol-fuzz
+      - name: Install pinned fuzz driver
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Validate locked fuzz dependencies
+        run: cargo +"${NIGHTLY_TOOLCHAIN}" fetch --locked --manifest-path fuzz/Cargo.toml
+      - name: Run bounded parser and frame fuzzing
+        run: |
+          install -d -m 0700 \
+            "$RUNNER_TEMP/protocol-fuzz-artifacts" \
+            "$RUNNER_TEMP/protocol-fuzz-corpus"
+          cp -- fuzz/corpus/frame_and_messages/* "$RUNNER_TEMP/protocol-fuzz-corpus/"
+          cargo +"${NIGHTLY_TOOLCHAIN}" fuzz run frame_and_messages \
+            "$RUNNER_TEMP/protocol-fuzz-corpus" -- \
+            -artifact_prefix="$RUNNER_TEMP/protocol-fuzz-artifacts/" \
+            -max_len=65536 \
+            -max_total_time=300 \
+            -rss_limit_mb=2048 \
+            -runs=1000000 \
+            -seed=20260819 \
+            -timeout=5
+          git diff --exit-code -- fuzz/Cargo.lock
+      - name: Upload bounded crash input
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: protocol-fuzz-crash-${{ github.sha }}
+          path: ${{ runner.temp }}/protocol-fuzz-artifacts
+          if-no-files-found: ignore
+          retention-days: 7
+
+  protocol-miri:
+    name: Protocol unsafe buffer Miri
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # pinned installer action
+        with:
+          toolchain: ${{ env.NIGHTLY_TOOLCHAIN }}
+          components: miri,rust-src
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: protocol-miri
+      - name: Prepare Miri sysroot
+        run: cargo +"${NIGHTLY_TOOLCHAIN}" miri setup
+      - name: Check aligned unsafe buffer ownership
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance
+        run: cargo +"${NIGHTLY_TOOLCHAIN}" miri test --lib mem::tests -- --test-threads=1

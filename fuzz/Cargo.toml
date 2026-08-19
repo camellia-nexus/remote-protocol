@@ -1,0 +1,22 @@
+[package]
+name = "camellia-remote-protocol-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+camellia-remote-protocol = { path = ".." }
+
+[[bin]]
+name = "frame_and_messages"
+path = "fuzz_targets/frame_and_messages.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
