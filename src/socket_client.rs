@@ -131,8 +131,9 @@ pub async fn connect_tcp<
 ) -> ResultType<crate::Stream> {
     let target_str = check_ws(&target.to_string());
     if is_ws_endpoint(&target_str) {
+        let proxy = Config::get_socks();
         return Ok(Stream::WebSocket(
-            websocket::WsFramedStream::new(target_str, None, None, ms_timeout).await?,
+            websocket::WsFramedStream::new(target_str, None, proxy.as_ref(), ms_timeout).await?,
         ));
     }
     connect_tcp_local(target, None, ms_timeout).await
