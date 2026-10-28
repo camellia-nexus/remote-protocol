@@ -5,7 +5,7 @@ use crate::{
     crypto::secretbox::Key,
     protobuf::Message,
     socket_client::split_host_port,
-    tcp::Encrypt,
+    tcp::{DynTcpStream, Encrypt, FramedStream},
     tls::TlsType,
     ResultType,
 };
@@ -15,7 +15,7 @@ use futures::{SinkExt, StreamExt};
 use std::{io::Error, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{net::TcpStream, time::timeout};
 use tokio_tungstenite::{
-    connect_async_tls_with_config,
+    client_async_tls_with_config,
     tungstenite::{
         self,
         client::IntoClientRequest,
@@ -25,7 +25,7 @@ use tokio_tungstenite::{
 };
 
 pub struct WsFramedStream {
-    stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    stream: WebSocketStream<MaybeTlsStream<DynTcpStream>>,
     addr: SocketAddr,
     encrypt: Option<Encrypt>,
     send_timeout: u64,
@@ -37,52 +37,77 @@ impl WsFramedStream {
         match tls_type {
             TlsType::Plain => Ok(Some(Connector::Plain)),
             TlsType::Rustls => {
-                let connector = match crate::verifier::client_config() {
-                    Ok(client_config) => Some(Connector::Rustls(Arc::new(client_config))),
-                    Err(e) => {
-                        log::warn!(
-                            "Failed to get client config: {:?}, fallback to default connector",
-                            e
-                        );
-                        None
-                    }
-                };
-                Ok(connector)
+                // Failure to build the selected verifier is not permission to
+                // switch trust policy via tungstenite's default connector.
+                Ok(Some(Connector::Rustls(Arc::new(
+                    crate::verifier::client_config()?,
+                ))))
             }
         }
     }
 
     async fn connect(
         url: &str,
+        local_addr: Option<SocketAddr>,
+        proxy_conf: Option<&Socks5Server>,
         ms_timeout: u64,
-    ) -> ResultType<WebSocketStream<MaybeTlsStream<TcpStream>>> {
-        // to-do: websocket proxy.
-
+    ) -> ResultType<(WebSocketStream<MaybeTlsStream<DynTcpStream>>, SocketAddr)> {
         let tls_type = TlsType::for_url(url)?;
-        Self::try_connect(url, ms_timeout, tls_type).await
+        timeout(
+            Duration::from_millis(ms_timeout),
+            Self::try_connect(url, local_addr, proxy_conf, ms_timeout, tls_type),
+        )
+        .await?
     }
 
     async fn try_connect(
         url: &str,
+        local_addr: Option<SocketAddr>,
+        proxy_conf: Option<&Socks5Server>,
         ms_timeout: u64,
         tls_type: TlsType,
-    ) -> ResultType<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+    ) -> ResultType<(WebSocketStream<MaybeTlsStream<DynTcpStream>>, SocketAddr)> {
         let ws_config = None;
-        let disable_nagle = false;
         let request = url.into_client_request().map_err(Error::other)?;
+        if !matches!(request.uri().scheme_str(), Some("ws" | "wss")) {
+            bail!("Invalid WebSocket URL scheme");
+        }
+        let host = request
+            .uri()
+            .host()
+            .ok_or_else(|| Error::other("Missing WebSocket host"))?;
+        let port = request
+            .uri()
+            .port_u16()
+            .unwrap_or(if tls_type == TlsType::Rustls { 443 } else { 80 });
+        let host = host
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+            .unwrap_or(host);
         let connector = Self::get_connector(&tls_type)?;
-        match timeout(
-            Duration::from_millis(ms_timeout),
-            connect_async_tls_with_config(request, ws_config, disable_nagle, connector),
-        )
-        .await?
-        {
-            Ok((ws_stream, _)) => Ok(ws_stream),
+        // Pick exactly one route. Retain BufStream/TLS tunnel buffering when
+        // removing only the unused protobuf codec, then layer destination TLS
+        // and WebSocket on top (including TLS-inside-HTTPS-proxy TLS).
+        let transport = match proxy_conf {
+            Some(proxy) => {
+                FramedStream::connect((host, port), local_addr, proxy, ms_timeout).await?
+            }
+            None => {
+                let target = match host.parse::<std::net::IpAddr>() {
+                    Ok(ip) => SocketAddr::new(ip, port).to_string(),
+                    Err(_) => format!("{host}:{port}"),
+                };
+                FramedStream::new(target, local_addr, ms_timeout).await?
+            }
+        };
+        let addr = transport.local_addr();
+        let transport = transport.0.into_inner();
+        match client_async_tls_with_config(request, transport, ws_config, connector).await {
+            Ok((ws_stream, _)) => Ok((ws_stream, addr)),
             Err(e) => {
                 log::error!(
-                    "WebSocket connection failed with tls_type {:?}: {}, {:?}",
+                    "WebSocket connection failed with tls_type {:?}: {:?}",
                     tls_type,
-                    url,
                     e
                 );
                 if let tungstenite::Error::Http(response) = &e {
@@ -100,16 +125,12 @@ impl WsFramedStream {
 
     pub async fn new<T: AsRef<str>>(
         url: T,
-        _local_addr: Option<SocketAddr>,
-        _proxy_conf: Option<&Socks5Server>,
+        local_addr: Option<SocketAddr>,
+        proxy_conf: Option<&Socks5Server>,
         ms_timeout: u64,
     ) -> ResultType<Self> {
-        let stream = Self::connect(url.as_ref(), ms_timeout).await?;
-        let addr = match stream.get_ref() {
-            MaybeTlsStream::Plain(tcp) => tcp.peer_addr()?,
-            MaybeTlsStream::Rustls(tls) => tls.get_ref().0.peer_addr()?,
-            _ => return Err(Error::other("Unsupported stream type").into()),
-        };
+        let (stream, addr) =
+            Self::connect(url.as_ref(), local_addr, proxy_conf, ms_timeout).await?;
 
         let ws = Self {
             stream,
@@ -128,9 +149,12 @@ impl WsFramedStream {
 
     #[inline]
     pub async fn from_tcp_stream(stream: TcpStream, addr: SocketAddr) -> ResultType<Self> {
-        let ws_stream =
-            WebSocketStream::from_raw_socket(MaybeTlsStream::Plain(stream), Role::Client, None)
-                .await;
+        let ws_stream = WebSocketStream::from_raw_socket(
+            MaybeTlsStream::Plain(DynTcpStream(Box::new(stream))),
+            Role::Client,
+            None,
+        )
+        .await;
 
         Ok(Self {
             stream: ws_stream,
@@ -374,6 +398,183 @@ mod tests {
             *PROD_RENDEZVOUS_SERVER.write().unwrap() = self.prod_rendezvous_server.clone();
             *EXE_RENDEZVOUS_SERVER.write().unwrap() = self.exe_rendezvous_server.clone();
         }
+    }
+
+    #[tokio::test]
+    async fn configured_proxy_failure_must_not_open_a_direct_websocket() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let direct = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination = direct.local_addr().unwrap();
+        // A listening but nonresponsive proxy makes the chosen route fail its
+        // deadline. It must never cause a connection to the direct endpoint.
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = Socks5Server {
+            proxy: format!("http://{}", proxy_listener.local_addr().unwrap()),
+            ..Default::default()
+        };
+        let direct_connections = Arc::new(AtomicUsize::new(0));
+        let observed = direct_connections.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = direct.accept().await.unwrap();
+            observed.fetch_add(1, Ordering::SeqCst);
+            tokio_tungstenite::accept_async(stream).await.unwrap()
+        });
+        let result =
+            WsFramedStream::new(format!("ws://{destination}/ws/id"), None, Some(&proxy), 250).await;
+        server.abort();
+        let _ = server.await;
+        assert!(
+            result.is_err(),
+            "configured proxy was bypassed for a direct WebSocket"
+        );
+        assert_eq!(direct_connections.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn http_proxy_tunnel_preserves_target_path_and_keeps_auth_out_of_websocket() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        struct CheckProxyUpgrade;
+        impl tungstenite::handshake::server::Callback for CheckProxyUpgrade {
+            fn on_request(
+                self,
+                request: &tungstenite::handshake::server::Request,
+                response: tungstenite::handshake::server::Response,
+            ) -> Result<
+                tungstenite::handshake::server::Response,
+                tungstenite::handshake::server::ErrorResponse,
+            > {
+                assert_eq!(
+                    request.uri().path_and_query().unwrap().as_str(),
+                    "/ws/relay?test=1"
+                );
+                assert_eq!(request.headers()["host"], "unresolved.invalid");
+                assert!(!request.headers().contains_key("proxy-authorization"));
+                Ok(response)
+            }
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = Socks5Server {
+            proxy: format!("http://{}", listener.local_addr().unwrap()),
+            username: "test-user".to_owned(),
+            password: "NET006-test-only".to_owned(),
+        };
+        let server = tokio::spawn(async move {
+            let (mut stream, peer) = listener.accept().await.unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                assert!(header.len() < 4096);
+                header.push(stream.read_u8().await.unwrap());
+            }
+            let header = String::from_utf8(header).unwrap();
+            assert!(header.starts_with("CONNECT unresolved.invalid:80 HTTP/1.1\r\n"));
+            assert!(header.contains("Proxy-Authorization: Basic "));
+            stream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+            let mut websocket = tokio_tungstenite::accept_hdr_async(stream, CheckProxyUpgrade)
+                .await
+                .unwrap();
+            websocket
+                .send(WsMessage::Binary(b"through-http-proxy".to_vec().into()))
+                .await
+                .unwrap();
+            peer
+        });
+        let mut stream = WsFramedStream::new(
+            "ws://unresolved.invalid/ws/relay?test=1",
+            Some("127.0.0.1:0".parse().unwrap()),
+            Some(&proxy),
+            2000,
+        )
+        .await
+        .unwrap();
+        let received = stream.next_timeout(1000).await.unwrap().unwrap();
+        assert_eq!(&received[..], b"through-http-proxy");
+        assert_eq!(stream.local_addr(), server.await.unwrap());
+        assert!(!stream.is_tls());
+    }
+
+    #[tokio::test]
+    async fn socks_proxy_resolves_destination_remotely_with_and_without_authentication() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for authenticate in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy = Socks5Server {
+                proxy: format!("socks5://{}", listener.local_addr().unwrap()),
+                username: if authenticate { "test-user" } else { "" }.to_owned(),
+                password: if authenticate { "NET006-test-only" } else { "" }.to_owned(),
+            };
+            let server = tokio::spawn(async move {
+                let (mut stream, peer) = listener.accept().await.unwrap();
+                assert_eq!(stream.read_u8().await.unwrap(), 5);
+                let method_count = stream.read_u8().await.unwrap() as usize;
+                let mut methods = vec![0; method_count];
+                stream.read_exact(&mut methods).await.unwrap();
+                let method = if authenticate { 2 } else { 0 };
+                assert!(methods.contains(&method));
+                stream.write_all(&[5, method]).await.unwrap();
+                if authenticate {
+                    assert_eq!(stream.read_u8().await.unwrap(), 1);
+                    let length = stream.read_u8().await.unwrap() as usize;
+                    let mut username = vec![0; length];
+                    stream.read_exact(&mut username).await.unwrap();
+                    let length = stream.read_u8().await.unwrap() as usize;
+                    let mut password = vec![0; length];
+                    stream.read_exact(&mut password).await.unwrap();
+                    assert_eq!(username, b"test-user");
+                    assert_eq!(password, b"NET006-test-only");
+                    stream.write_all(&[1, 0]).await.unwrap();
+                }
+                let mut head = [0; 4];
+                stream.read_exact(&mut head).await.unwrap();
+                assert_eq!(head, [5, 1, 0, 3]);
+                let length = stream.read_u8().await.unwrap() as usize;
+                let mut target = vec![0; length];
+                stream.read_exact(&mut target).await.unwrap();
+                assert_eq!(target, b"unresolved.invalid");
+                assert_eq!(stream.read_u16().await.unwrap(), 80);
+                stream
+                    .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 80])
+                    .await
+                    .unwrap();
+                let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                websocket
+                    .send(WsMessage::Binary(b"through-socks-proxy".to_vec().into()))
+                    .await
+                    .unwrap();
+                peer
+            });
+            let mut stream =
+                WsFramedStream::new("ws://unresolved.invalid/ws/id", None, Some(&proxy), 2000)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                &stream.next_timeout(1000).await.unwrap().unwrap()[..],
+                b"through-socks-proxy"
+            );
+            assert_eq!(stream.local_addr(), server.await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_must_honor_incompatible_explicit_local_binding() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let result = WsFramedStream::new(
+            format!("ws://{target}/ws/id"),
+            Some("[::1]:0".parse().unwrap()),
+            None,
+            250,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "explicit IPv6 binding must not silently become an IPv4 route"
+        );
+        assert!(timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err());
     }
 
     fn test_key() -> Key {
