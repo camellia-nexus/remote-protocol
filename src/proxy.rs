@@ -3,7 +3,6 @@ use std::{
     net::{SocketAddr, ToSocketAddrs},
 };
 
-use anyhow::bail;
 use base64::{engine::general_purpose, Engine};
 use http::uri::Authority;
 use httparse::{Error as HttpParseError, Response, EMPTY_HEADER};
@@ -486,11 +485,16 @@ impl Proxy {
                 let authority = connect_authority
                     .as_ref()
                     .ok_or(ProxyError::InvalidTargetAuthority)?;
-                let stream = self
-                    .https_connect_rustls_wrap(local, proxy, Some(stream), authority)
-                    .await?;
+                // There is already exactly one connected socket. A lazy or
+                // eager "fallback" here is unnecessary and would consume a
+                // second proxy connection before TLS/CONNECT can proceed.
+                let stream = super::timeout(
+                    self.ms_timeout,
+                    self.https_connect_rustls_authority(stream, authority),
+                )
+                .await??;
                 Ok(FramedStream(
-                    Framed::new(stream, BytesCodec::for_session()),
+                    Framed::new(DynTcpStream(Box::new(stream)), BytesCodec::for_session()),
                     addr,
                     None,
                     0,
@@ -522,31 +526,6 @@ impl Proxy {
                     None,
                     0,
                 ))
-            }
-        }
-    }
-
-    async fn https_connect_rustls_wrap(
-        &self,
-        local: SocketAddr,
-        proxy: SocketAddr,
-        stream: Option<tokio::net::TcpStream>,
-        authority: &ConnectAuthority,
-    ) -> ResultType<DynTcpStream> {
-        let stream = stream.unwrap_or(self.new_stream(local, proxy).await?);
-        match super::timeout(
-            self.ms_timeout,
-            self.https_connect_rustls_authority(stream, authority),
-        )
-        .await?
-        {
-            Ok(s) => Ok(DynTcpStream(Box::new(s))),
-            Err(e) => {
-                log::error!(
-                    "Failed to connect to HTTPS proxy server with rustls-tls: {:?}.",
-                    e
-                );
-                bail!(e)
             }
         }
     }
@@ -677,6 +656,34 @@ mod tests {
     use super::*;
     use std::borrow::Cow;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn https_proxy_uses_only_one_tcp_connection_even_when_tls_fails() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = listener.local_addr().unwrap();
+        let (stop, mut stopped) = tokio::sync::oneshot::channel();
+        let observed = tokio::spawn(async move {
+            let mut connections = Vec::new();
+            loop {
+                tokio::select! {
+                    connection = listener.accept() => connections.push(connection.unwrap().0),
+                    _ = &mut stopped => break,
+                }
+            }
+            connections.len()
+        });
+        let proxy = Proxy::new(format!("https://{proxy_address}"), 250).unwrap();
+        assert!(proxy
+            .connect(("unresolved.invalid", 80), None)
+            .await
+            .is_err());
+        stop.send(()).unwrap();
+        assert_eq!(
+            observed.await.unwrap(),
+            1,
+            "a supplied stream must never evaluate a second connection fallback"
+        );
+    }
 
     async fn captured_connect_request(
         proxy: &Proxy,
