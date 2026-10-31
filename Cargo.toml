@@ -79,6 +79,8 @@ protobuf-codegen = { version = "3.7" }
 [dev-dependencies]
 clap = "4.5.51"
 hex-literal = "1.0.0"
+# Ephemeral in-memory test certificates; never a product TLS verifier bypass.
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring"] }
 tempfile = "3.27.0"
 
 [target.'cfg(target_os = "windows")'.dependencies]

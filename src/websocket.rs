@@ -4,6 +4,7 @@ use crate::{
     },
     crypto::secretbox::Key,
     protobuf::Message,
+    proxy::{Proxy, ProxyScheme},
     socket_client::split_host_port,
     tcp::{DynTcpStream, Encrypt, FramedStream},
     tls::TlsType,
@@ -14,6 +15,7 @@ use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
 use std::{io::Error, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{net::TcpStream, time::timeout};
+use tokio_rustls::rustls::ClientConfig;
 use tokio_tungstenite::{
     client_async_tls_with_config,
     tungstenite::{
@@ -33,15 +35,18 @@ pub struct WsFramedStream {
 
 impl WsFramedStream {
     #[inline]
-    fn get_connector(tls_type: &TlsType) -> ResultType<Option<Connector>> {
+    fn get_connector(
+        tls_type: &TlsType,
+        config: Option<Arc<ClientConfig>>,
+    ) -> ResultType<Option<Connector>> {
         match tls_type {
             TlsType::Plain => Ok(Some(Connector::Plain)),
             TlsType::Rustls => {
                 // Failure to build the selected verifier is not permission to
                 // switch trust policy via tungstenite's default connector.
-                Ok(Some(Connector::Rustls(Arc::new(
-                    crate::verifier::client_config()?,
-                ))))
+                Ok(Some(Connector::Rustls(config.ok_or_else(|| {
+                    Error::other("Missing WebSocket TLS policy")
+                })?)))
             }
         }
     }
@@ -51,11 +56,14 @@ impl WsFramedStream {
         local_addr: Option<SocketAddr>,
         proxy_conf: Option<&Socks5Server>,
         ms_timeout: u64,
+        tls_config: Option<Arc<ClientConfig>>,
     ) -> ResultType<(WebSocketStream<MaybeTlsStream<DynTcpStream>>, SocketAddr)> {
         let tls_type = TlsType::for_url(url)?;
         timeout(
             Duration::from_millis(ms_timeout),
-            Self::try_connect(url, local_addr, proxy_conf, ms_timeout, tls_type),
+            Self::try_connect(
+                url, local_addr, proxy_conf, ms_timeout, tls_type, tls_config,
+            ),
         )
         .await?
     }
@@ -66,6 +74,7 @@ impl WsFramedStream {
         proxy_conf: Option<&Socks5Server>,
         ms_timeout: u64,
         tls_type: TlsType,
+        tls_config: Option<Arc<ClientConfig>>,
     ) -> ResultType<(WebSocketStream<MaybeTlsStream<DynTcpStream>>, SocketAddr)> {
         let ws_config = None;
         let request = url.into_client_request().map_err(Error::other)?;
@@ -84,13 +93,32 @@ impl WsFramedStream {
             .strip_prefix('[')
             .and_then(|value| value.strip_suffix(']'))
             .unwrap_or(host);
-        let connector = Self::get_connector(&tls_type)?;
+        let proxy = proxy_conf
+            .map(|conf| Proxy::from_conf(conf, Some(ms_timeout)))
+            .transpose()?;
+        let needs_tls = tls_type == TlsType::Rustls
+            || proxy
+                .as_ref()
+                .is_some_and(|proxy| matches!(&proxy.intercept, ProxyScheme::Https { .. }));
+        // Build one policy before the first socket is opened. Both TLS layers
+        // retain the same Arc even if application configuration changes later.
+        let tls_config = if needs_tls {
+            Some(match tls_config {
+                Some(config) => config,
+                None => Arc::new(crate::verifier::client_config()?),
+            })
+        } else {
+            None
+        };
+        let connector = Self::get_connector(&tls_type, tls_config.clone())?;
         // Pick exactly one route. Retain BufStream/TLS tunnel buffering when
         // removing only the unused protobuf codec, then layer destination TLS
         // and WebSocket on top (including TLS-inside-HTTPS-proxy TLS).
-        let transport = match proxy_conf {
+        let transport = match proxy {
             Some(proxy) => {
-                FramedStream::connect((host, port), local_addr, proxy, ms_timeout).await?
+                proxy
+                    .connect_with_tls_config((host, port), local_addr, tls_config)
+                    .await?
             }
             None => {
                 let target = match host.parse::<std::net::IpAddr>() {
@@ -104,22 +132,7 @@ impl WsFramedStream {
         let transport = transport.0.into_inner();
         match client_async_tls_with_config(request, transport, ws_config, connector).await {
             Ok((ws_stream, _)) => Ok((ws_stream, addr)),
-            Err(e) => {
-                log::error!(
-                    "WebSocket connection failed with tls_type {:?}: {:?}",
-                    tls_type,
-                    e
-                );
-                if let tungstenite::Error::Http(response) = &e {
-                    if response.status().is_redirection() {
-                        bail!(
-                            "WebSocket connection failed ({}). The server may not support WebSocket.",
-                            e
-                        )
-                    }
-                }
-                bail!("WebSocket error: {}", e)
-            }
+            Err(error) => Err(handshake_error(error)),
         }
     }
 
@@ -129,8 +142,18 @@ impl WsFramedStream {
         proxy_conf: Option<&Socks5Server>,
         ms_timeout: u64,
     ) -> ResultType<Self> {
+        Self::new_with_tls_config(url.as_ref(), local_addr, proxy_conf, ms_timeout, None).await
+    }
+
+    async fn new_with_tls_config(
+        url: &str,
+        local_addr: Option<SocketAddr>,
+        proxy_conf: Option<&Socks5Server>,
+        ms_timeout: u64,
+        tls_config: Option<Arc<ClientConfig>>,
+    ) -> ResultType<Self> {
         let (stream, addr) =
-            Self::connect(url.as_ref(), local_addr, proxy_conf, ms_timeout).await?;
+            Self::connect(url, local_addr, proxy_conf, ms_timeout, tls_config).await?;
 
         let ws = Self {
             stream,
@@ -279,6 +302,24 @@ impl WsFramedStream {
     }
 }
 
+// Peer-controlled headers/body and URL credentials must not escape through an
+// error chain or Debug log. Keep the stage, status, or I/O classification only.
+fn handshake_error(error: tungstenite::Error) -> anyhow::Error {
+    match error {
+        tungstenite::Error::Http(response) => anyhow::anyhow!(
+            "WebSocket upgrade rejected status={}",
+            response.status().as_u16()
+        ),
+        tungstenite::Error::Tls(_) => anyhow::anyhow!("WebSocket destination TLS handshake failed"),
+        tungstenite::Error::Io(error) => {
+            Error::new(error.kind(), "WebSocket handshake I/O failed").into()
+        }
+        tungstenite::Error::Protocol(_) => anyhow::anyhow!("WebSocket upgrade protocol failed"),
+        tungstenite::Error::Url(_) => anyhow::anyhow!("Invalid WebSocket endpoint"),
+        _ => anyhow::anyhow!("WebSocket handshake failed"),
+    }
+}
+
 pub fn is_ws_endpoint(endpoint: &str) -> bool {
     endpoint.starts_with("ws://") || endpoint.starts_with("wss://")
 }
@@ -356,6 +397,9 @@ pub fn check_ws(endpoint: &str) -> String {
     };
     format!("{}://{}", protocol, address)
 }
+
+#[cfg(test)]
+mod proxy_tests;
 
 #[cfg(test)]
 mod tests {

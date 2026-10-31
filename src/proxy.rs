@@ -1,6 +1,7 @@
 use std::{
     io::Error as IoError,
     net::{SocketAddr, ToSocketAddrs},
+    sync::Arc,
 };
 
 use base64::{engine::general_purpose, Engine};
@@ -8,6 +9,7 @@ use http::uri::Authority;
 use httparse::{Error as HttpParseError, Response, EMPTY_HEADER};
 use thiserror::Error as ThisError;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufStream};
+use tokio_rustls::rustls::ClientConfig;
 use tokio_rustls::{client::TlsStream as RustlsTlsStream, TlsConnector as RustlsTlsConnector};
 use tokio_socks::{tcp::Socks5Stream, IntoTargetAddr, TargetAddr};
 use tokio_util::codec::Framed;
@@ -440,6 +442,20 @@ impl Proxy {
     where
         T: IntoTargetAddr<'t>,
     {
+        self.connect_with_tls_config(target, local_addr, None).await
+    }
+
+    /// Reuse the connection's frozen verifier for an HTTPS proxy and an inner
+    /// TLS protocol. This does not relax certificate/name verification.
+    pub(crate) async fn connect_with_tls_config<'t, T>(
+        &self,
+        target: T,
+        local_addr: Option<SocketAddr>,
+        tls_config: Option<Arc<ClientConfig>>,
+    ) -> ResultType<FramedStream>
+    where
+        T: IntoTargetAddr<'t>,
+    {
         let target_addr = target
             .into_target_addr()
             .map_err(|e| ProxyError::TargetParseError(e.to_string()))?;
@@ -490,7 +506,7 @@ impl Proxy {
                 // second proxy connection before TLS/CONNECT can proceed.
                 let stream = super::timeout(
                     self.ms_timeout,
-                    self.https_connect_rustls_authority(stream, authority),
+                    self.https_connect_rustls_authority(stream, authority, tls_config),
                 )
                 .await??;
                 Ok(FramedStream(
@@ -539,13 +555,15 @@ impl Proxy {
         Input: AsyncRead + AsyncWrite + Unpin,
     {
         let authority = ConnectAuthority::from_target(target_addr)?;
-        self.https_connect_rustls_authority(io, &authority).await
+        self.https_connect_rustls_authority(io, &authority, None)
+            .await
     }
 
     async fn https_connect_rustls_authority<Input>(
         &self,
         io: Input,
         authority: &ConnectAuthority,
+        tls_config: Option<Arc<ClientConfig>>,
     ) -> Result<BufStream<RustlsTlsStream<Input>>, ProxyError>
     where
         Input: AsyncRead + AsyncWrite + Unpin,
@@ -556,9 +574,14 @@ impl Proxy {
         let domain = rustls_pki_types::ServerName::try_from(url_domain.as_str())
             .map_err(|e| ProxyError::AddressResolutionFailed(e.to_string()))?
             .to_owned();
-        let client_config = crate::verifier::client_config()
-            .map_err(|e| ProxyError::IoError(std::io::Error::other(e)))?;
-        let tls_connector = RustlsTlsConnector::from(std::sync::Arc::new(client_config));
+        let client_config = match tls_config {
+            Some(config) => config,
+            None => Arc::new(
+                crate::verifier::client_config()
+                    .map_err(|e| ProxyError::IoError(std::io::Error::other(e)))?,
+            ),
+        };
+        let tls_connector = RustlsTlsConnector::from(client_config);
         let stream = tls_connector.connect(domain, io).await?;
         self.http_connect_authority(stream, authority).await
     }
