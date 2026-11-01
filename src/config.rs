@@ -2060,16 +2060,33 @@ impl Config {
         Self::try_set_trusted_devices(devices)
     }
 
-    pub fn remove_trusted_devices<S: AsRef<str>>(device_ids: &[S]) -> ResultType<()> {
+    pub fn remove_trusted_devices(hwids: &[Bytes]) -> ResultType<()> {
         let mut devices = Self::get_trusted_devices();
-        devices.retain(|d| !device_ids.iter().any(|id| id.as_ref() == d.device_id));
+        devices.retain(|d| {
+            !hwids.iter().any(|h| {
+                h == &d.hwid
+                    || (!d.device_id.is_empty() && d.device_id.as_bytes() == h.as_ref())
+                    || (!d.public_key_fingerprint.is_empty()
+                        && d.public_key_fingerprint.as_bytes() == h.as_ref())
+            })
+        });
+        Self::try_set_trusted_devices(devices)
+    }
+
+    pub fn remove_trusted_devices_by_id<S: AsRef<str>>(device_ids: &[S]) -> ResultType<()> {
+        let mut devices = Self::get_trusted_devices();
+        devices.retain(|d| {
+            !device_ids.iter().any(|id| {
+                id.as_ref() == d.device_id
+                    || id.as_ref() == d.public_key_fingerprint
+                    || id.as_ref().as_bytes() == d.hwid.as_ref()
+            })
+        });
         Self::try_set_trusted_devices(devices)
     }
 
     pub fn remove_trusted_devices_by_hwid(hwids: &[Bytes]) -> ResultType<()> {
-        let mut devices = Self::get_trusted_devices();
-        devices.retain(|d| !hwids.contains(&d.hwid));
-        Self::try_set_trusted_devices(devices)
+        Self::remove_trusted_devices(hwids)
     }
 
     pub fn try_clear_trusted_devices() -> ResultType<()> {
@@ -5287,14 +5304,14 @@ mod tests {
         assert_eq!(found.name, "Work Laptop (Renamed)");
 
         // Removal by device ID slice (&[String] and &[&str])
-        assert!(Config::remove_trusted_devices(&["controller-peer-01"]).is_ok());
+        assert!(Config::remove_trusted_devices_by_id(&["controller-peer-01"]).is_ok());
         let devices = Config::get_trusted_devices();
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].device_id, "controller-peer-02");
 
         // Removal of second device
         let to_remove = vec!["controller-peer-02".to_string()];
-        assert!(Config::remove_trusted_devices(&to_remove).is_ok());
+        assert!(Config::remove_trusted_devices_by_id(&to_remove).is_ok());
         assert!(Config::get_trusted_devices().is_empty());
     }
 
