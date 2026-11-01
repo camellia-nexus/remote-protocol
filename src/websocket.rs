@@ -26,6 +26,62 @@ use tokio_tungstenite::{
     Connector, MaybeTlsStream, WebSocketStream,
 };
 
+// Control WebSocket budget (Rendezvous / ID / Online / General Control)
+pub const WS_CONTROL_READ_BUFFER_SIZE: usize = 16 * 1024; // 16 KiB
+pub const WS_CONTROL_WRITE_BUFFER_SIZE: usize = 16 * 1024; // 16 KiB
+pub const WS_CONTROL_MAX_WRITE_BUFFER_SIZE: usize = 1024 * 1024; // 1 MiB
+pub const WS_CONTROL_MAX_FRAME_SIZE: usize = 1024 * 1024; // 1 MiB
+pub const WS_CONTROL_MAX_MESSAGE_SIZE: usize = 1024 * 1024; // 1 MiB
+
+// Relay / Session WebSocket budget (Relay Data Channel)
+pub const WS_RELAY_READ_BUFFER_SIZE: usize = 32 * 1024; // 32 KiB
+pub const WS_RELAY_WRITE_BUFFER_SIZE: usize = 32 * 1024; // 32 KiB
+pub const WS_RELAY_MAX_WRITE_BUFFER_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
+pub const WS_RELAY_MAX_FRAME_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
+pub const WS_RELAY_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
+
+#[inline]
+pub fn control_websocket_config() -> tungstenite::protocol::WebSocketConfig {
+    tungstenite::protocol::WebSocketConfig::default()
+        .read_buffer_size(WS_CONTROL_READ_BUFFER_SIZE)
+        .write_buffer_size(WS_CONTROL_WRITE_BUFFER_SIZE)
+        .max_write_buffer_size(WS_CONTROL_MAX_WRITE_BUFFER_SIZE)
+        .max_frame_size(Some(WS_CONTROL_MAX_FRAME_SIZE))
+        .max_message_size(Some(WS_CONTROL_MAX_MESSAGE_SIZE))
+        .accept_unmasked_frames(false)
+}
+
+#[inline]
+pub fn relay_websocket_config() -> tungstenite::protocol::WebSocketConfig {
+    tungstenite::protocol::WebSocketConfig::default()
+        .read_buffer_size(WS_RELAY_READ_BUFFER_SIZE)
+        .write_buffer_size(WS_RELAY_WRITE_BUFFER_SIZE)
+        .max_write_buffer_size(WS_RELAY_MAX_WRITE_BUFFER_SIZE)
+        .max_frame_size(Some(WS_RELAY_MAX_FRAME_SIZE))
+        .max_message_size(Some(WS_RELAY_MAX_MESSAGE_SIZE))
+        .accept_unmasked_frames(false)
+}
+
+#[inline]
+pub fn default_websocket_config_for_url(url: &url::Url) -> tungstenite::protocol::WebSocketConfig {
+    if url.path().contains("/ws/relay") || url.port() == Some(21119) {
+        relay_websocket_config()
+    } else {
+        control_websocket_config()
+    }
+}
+
+#[inline]
+pub fn default_websocket_config_for_url_str(url: &str) -> tungstenite::protocol::WebSocketConfig {
+    if let Ok(parsed) = url::Url::parse(url) {
+        default_websocket_config_for_url(&parsed)
+    } else if url.contains("/ws/relay") || url.contains(":21119") {
+        relay_websocket_config()
+    } else {
+        control_websocket_config()
+    }
+}
+
 pub struct WsFramedStream {
     stream: WebSocketStream<MaybeTlsStream<DynTcpStream>>,
     addr: SocketAddr,
@@ -76,7 +132,7 @@ impl WsFramedStream {
         tls_type: TlsType,
         tls_config: Option<Arc<ClientConfig>>,
     ) -> ResultType<(WebSocketStream<MaybeTlsStream<DynTcpStream>>, SocketAddr)> {
-        let ws_config = None;
+        let ws_config = Some(default_websocket_config_for_url_str(url));
         let request = url.into_client_request().map_err(Error::other)?;
         if !matches!(request.uri().scheme_str(), Some("ws" | "wss")) {
             bail!("Invalid WebSocket URL scheme");
@@ -172,10 +228,19 @@ impl WsFramedStream {
 
     #[inline]
     pub async fn from_tcp_stream(stream: TcpStream, addr: SocketAddr) -> ResultType<Self> {
+        Self::from_tcp_stream_with_config(stream, addr, control_websocket_config()).await
+    }
+
+    #[inline]
+    pub async fn from_tcp_stream_with_config(
+        stream: TcpStream,
+        addr: SocketAddr,
+        config: tungstenite::protocol::WebSocketConfig,
+    ) -> ResultType<Self> {
         let ws_stream = WebSocketStream::from_raw_socket(
             MaybeTlsStream::Plain(DynTcpStream(Box::new(stream))),
             Role::Client,
-            None,
+            Some(config),
         )
         .await;
 
@@ -228,15 +293,31 @@ impl WsFramedStream {
 
     pub async fn send_bytes(&mut self, bytes: Bytes) -> ResultType<()> {
         let msg = WsMessage::Binary(bytes);
-        if self.send_timeout > 0 {
-            timeout(
+        let res = if self.send_timeout > 0 {
+            match timeout(
                 Duration::from_millis(self.send_timeout),
                 self.stream.send(msg),
             )
-            .await??
+            .await
+            {
+                Ok(res) => res,
+                Err(_) => {
+                    self.close_after_protocol_error().await;
+                    return Err(Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "WebSocket send timed out",
+                    )
+                    .into());
+                }
+            }
         } else {
-            self.stream.send(msg).await?
+            self.stream.send(msg).await
         };
+
+        if let Err(err) = res {
+            self.close_after_protocol_error().await;
+            return Err(err.into());
+        }
         Ok(())
     }
 
@@ -253,6 +334,7 @@ impl WsFramedStream {
                 Ok(msg) => msg,
                 Err(e) => {
                     log::error!("{}", e);
+                    self.close_after_protocol_error().await;
                     return Some(Err(Error::other(format!(
                         "WebSocket protocol error: {}",
                         e
@@ -879,5 +961,117 @@ mod tests {
         assert_eq!(check_ws("127.0.0.1:23455"), "ws://127.0.0.1:23458");
         assert_eq!(check_ws("127.0.0.1:23456"), "ws://127.0.0.1:23458");
         assert_eq!(check_ws("127.0.0.1:34567"), "ws://127.0.0.1:34569");
+    }
+
+    #[test]
+    fn test_net_007_websocket_config_budget_invariants() {
+        let control = control_websocket_config();
+        assert_eq!(control.read_buffer_size, 16 * 1024);
+        assert_eq!(control.write_buffer_size, 16 * 1024);
+        assert_eq!(control.max_write_buffer_size, 1024 * 1024);
+        assert_eq!(control.max_frame_size, Some(1024 * 1024));
+        assert_eq!(control.max_message_size, Some(1024 * 1024));
+        assert!(!control.accept_unmasked_frames);
+
+        let relay = relay_websocket_config();
+        assert_eq!(relay.read_buffer_size, 32 * 1024);
+        assert_eq!(relay.write_buffer_size, 32 * 1024);
+        assert_eq!(relay.max_write_buffer_size, 4 * 1024 * 1024);
+        assert_eq!(relay.max_frame_size, Some(4 * 1024 * 1024));
+        assert_eq!(relay.max_message_size, Some(4 * 1024 * 1024));
+        assert!(!relay.accept_unmasked_frames);
+
+        // Control endpoint URLs
+        let url_id = url::Url::parse("ws://remote.example.com/ws/id").unwrap();
+        assert_eq!(
+            default_websocket_config_for_url(&url_id).max_message_size,
+            Some(1024 * 1024)
+        );
+        let url_control_port = url::Url::parse("ws://127.0.0.1:21118").unwrap();
+        assert_eq!(
+            default_websocket_config_for_url(&url_control_port).max_message_size,
+            Some(1024 * 1024)
+        );
+
+        // Relay endpoint URLs
+        let url_relay = url::Url::parse("ws://remote.example.com/ws/relay").unwrap();
+        assert_eq!(
+            default_websocket_config_for_url(&url_relay).max_message_size,
+            Some(4 * 1024 * 1024)
+        );
+        let url_relay_port = url::Url::parse("ws://127.0.0.1:21119").unwrap();
+        assert_eq!(
+            default_websocket_config_for_url(&url_relay_port).max_message_size,
+            Some(4 * 1024 * 1024)
+        );
+        let url_relay_secure = url::Url::parse("wss://remote.example.com/ws/relay").unwrap();
+        assert_eq!(
+            default_websocket_config_for_url(&url_relay_secure).max_message_size,
+            Some(4 * 1024 * 1024)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_net_007_control_websocket_rejects_oversized_frame_and_fails_closed() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener must bind");
+        let addr = listener.local_addr().expect("listener address must exist");
+        let client = TcpStream::connect(addr).await.expect("client must connect");
+        let (mut server, _) = listener.accept().await.expect("server must accept");
+
+        // Client uses bounded control config (1 MiB max frame)
+        let mut client_ws = WsFramedStream::from_tcp_stream(client, addr)
+            .await
+            .expect("client websocket must initialize");
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Server writes a WebSocket binary frame header declaring length of 1 MiB + 1024 bytes
+        // (exceeds WS_CONTROL_MAX_FRAME_SIZE = 1 MiB).
+        // 0x82: FIN + Binary frame
+        // 0x7F: Server-to-client (unmasked) + 8-byte length indicator
+        // [0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x04, 0x00]: 1,049,600 bytes
+        let header = [0x82, 0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x04, 0x00];
+        server
+            .write_all(&header)
+            .await
+            .expect("server must write frame header");
+
+        // Client next() must return error and fail closed
+        let result = client_ws.next().await;
+        assert!(result.is_some(), "stream must yield result");
+        let err = result
+            .unwrap()
+            .expect_err("oversized frame must be rejected");
+        assert!(
+            err.to_string().contains("WebSocket protocol error")
+                || err.to_string().contains("Capacity")
+                || err.to_string().contains("Frame too large"),
+            "error must indicate protocol/capacity error: {}",
+            err
+        );
+
+        // Server should observe client closing the connection
+        let mut buf = [0u8; 128];
+        let read_res = timeout(Duration::from_secs(1), server.read(&mut buf)).await;
+        assert!(read_res.is_ok(), "server must see client close/terminate");
+    }
+
+    #[tokio::test]
+    async fn test_net_007_control_websocket_accepts_valid_frame_within_budget() {
+        let (mut receiver, mut sender) = websocket_pair().await;
+        let valid_payload = vec![0x33; 64 * 1024]; // 64 KiB
+        sender
+            .send(WsMessage::Binary(valid_payload.clone().into()))
+            .await
+            .expect("server must send valid payload");
+
+        let bytes = receiver
+            .next()
+            .await
+            .expect("stream must yield payload")
+            .expect("valid payload within budget must be accepted");
+        assert_eq!(&bytes[..], &valid_payload[..]);
     }
 }

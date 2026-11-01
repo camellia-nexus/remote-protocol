@@ -10,78 +10,61 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio::net::{ToSocketAddrs, UdpSocket};
 use tokio_socks::{IntoTargetAddr, TargetAddr};
 
+use crate::endpoint::ParsedEndpoint;
+
 #[inline]
 pub fn check_port<T: std::string::ToString>(host: T, port: i32) -> String {
-    let host = host.to_string();
-    if crate::is_ipv6_str(&host) {
-        if host.starts_with('[') {
-            return host;
-        }
-        return format!("[{host}]:{port}");
+    let host_str = host.to_string();
+    let Ok(ep) = ParsedEndpoint::parse(&host_str) else {
+        return host_str;
+    };
+    if let Some(existing_port) = ep.port {
+        return format!("{}:{}", ep.raw_host, existing_port);
     }
-    if !host.contains(':') {
-        return format!("{host}:{port}");
+    if (1..=65535).contains(&port) {
+        format!("{}:{}", ep.raw_host, port)
+    } else {
+        host_str
     }
-    host
 }
 
 #[inline]
 pub fn increase_port<T: std::string::ToString>(host: T, offset: i32) -> String {
-    let host = host.to_string();
-    if crate::is_ipv6_str(&host) {
-        if host.starts_with('[') {
-            let tmp: Vec<&str> = host.split("]:").collect();
-            if tmp.len() == 2 {
-                let port: i32 = tmp[1].parse().unwrap_or(0);
-                if port > 0 {
-                    return format!("{}]:{}", tmp[0], port + offset);
-                }
-            }
-        }
-    } else if host.contains(':') {
-        let tmp: Vec<&str> = host.split(':').collect();
-        if tmp.len() == 2 {
-            let port: i32 = tmp[1].parse().unwrap_or(0);
-            if port > 0 {
-                return format!("{}:{}", tmp[0], port + offset);
-            }
-        }
-    }
-    host
+    let host_str = host.to_string();
+    let Ok(ep) = ParsedEndpoint::parse(&host_str) else {
+        return host_str;
+    };
+    let Some(current_port) = ep.port else {
+        return host_str;
+    };
+    let new_port = match (current_port as u32).checked_add_signed(offset) {
+        Some(p) if (1..=65535).contains(&p) => p as u16,
+        _ => return host_str,
+    };
+    format!("{}:{}", ep.raw_host, new_port)
 }
 
+#[inline]
 pub fn split_host_port<T: std::string::ToString>(host: T) -> Option<(String, i32)> {
-    let host = host.to_string();
-    if crate::is_ipv6_str(&host) {
-        if host.starts_with('[') {
-            let tmp: Vec<&str> = host.split("]:").collect();
-            if tmp.len() == 2 {
-                let port: i32 = tmp[1].parse().unwrap_or(0);
-                if port > 0 {
-                    return Some((format!("{}]", tmp[0]), port));
-                }
-            }
-        }
-    } else if host.contains(':') {
-        let tmp: Vec<&str> = host.split(':').collect();
-        if tmp.len() == 2 {
-            let port: i32 = tmp[1].parse().unwrap_or(0);
-            if port > 0 {
-                return Some((tmp[0].to_string(), port));
-            }
-        }
-    }
-    None
+    let host_str = host.to_string();
+    let ep = ParsedEndpoint::parse(&host_str).ok()?;
+    let port = ep.port?;
+    Some((ep.raw_host, port as i32))
 }
 
 pub fn test_if_valid_server(host: &str, test_with_proxy: bool) -> String {
-    let host = check_port(host, 0);
-    use std::net::ToSocketAddrs;
+    let ep = match ParsedEndpoint::parse(host) {
+        Ok(ep) => ep,
+        Err(err) => return err.to_string(),
+    };
+    let port = ep.port.unwrap_or(crate::config::RENDEZVOUS_PORT as u16);
+    let target = format!("{}:{}", ep.raw_host, port);
 
+    use std::net::ToSocketAddrs;
     if test_with_proxy && NetworkType::ProxySocks == Config::get_network_type() {
-        test_if_valid_server_for_proxy_(&host)
+        test_if_valid_server_for_proxy_(&target)
     } else {
-        match host.to_socket_addrs() {
+        match target.to_socket_addrs() {
             Err(err) => err.to_string(),
             Ok(_) => "".to_owned(),
         }
@@ -314,17 +297,24 @@ mod tests {
         assert!(test_if_valid_server_for_proxy_("1.1.1.1:1").is_empty());
         assert!(test_if_valid_server_for_proxy_("abc.com:0").is_empty());
         assert!(test_if_valid_server_for_proxy_("abcd.com:1").is_empty());
+
+        // NET-008: Strict validation rejects invalid endpoints and out-of-range ports
+        assert!(!test_if_valid_server("1:2:3", false).is_empty());
+        assert!(!test_if_valid_server("test.com:0", false).is_empty());
+        assert!(!test_if_valid_server("test.com:98989", false).is_empty());
+        assert!(!test_if_valid_server("1.1.1.1:0", false).is_empty());
+        assert!(!test_if_valid_server("1.1.1.1:65536", false).is_empty());
     }
 
     #[test]
     fn test_check_port() {
-        assert_eq!(check_port("[1:2]:12", 32), "[1:2]:12");
-        assert_eq!(check_port("1:2", 32), "[1:2]:32");
+        assert_eq!(check_port("[1::2]:12", 32), "[1::2]:12");
+        assert_eq!(check_port("1::2", 32), "[1::2]:32");
         assert_eq!(check_port("z1:2", 32), "z1:2");
         assert_eq!(check_port("1.1.1.1", 32), "1.1.1.1:32");
         assert_eq!(check_port("1.1.1.1:32", 32), "1.1.1.1:32");
         assert_eq!(check_port("test.com:32", 0), "test.com:32");
-        assert_eq!(increase_port("[1:2]:12", 1), "[1:2]:13");
+        assert_eq!(increase_port("[1::2]:12", 1), "[1::2]:13");
         assert_eq!(increase_port("1.2.2.4:12", 1), "1.2.2.4:13");
         assert_eq!(increase_port("1.2.2.4", 1), "1.2.2.4");
         assert_eq!(increase_port("test.com", 1), "test.com");
@@ -332,5 +322,11 @@ mod tests {
         assert_eq!(increase_port("1:13", 4), "1:13");
         assert_eq!(increase_port("22:1:13", 4), "22:1:13");
         assert_eq!(increase_port("z1:2", 1), "z1:3");
+        // NET-008: Checked port arithmetic boundary validation (1..=65535)
+        assert_eq!(increase_port("[::1]:65535", 1), "[::1]:65535");
+        assert_eq!(increase_port("test.com:1", -1), "test.com:1");
+        assert_eq!(increase_port("test.com:1", -2), "test.com:1");
+        assert_eq!(increase_port("1.2.3.4:21116", 1), "1.2.3.4:21117");
+        assert_eq!(increase_port("[::1]:21116", -1), "[::1]:21115");
     }
 }
