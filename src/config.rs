@@ -873,7 +873,9 @@ pub fn store_path_durable<T: serde::Serialize>(
     let rand_id: u64 = rand::random();
     let temp_file_name = format!(
         ".{}_{}_{:x}.tmp",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("config"),
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("config"),
         std::process::id(),
         rand_id
     );
