@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use bytes::Bytes;
 use rand::RngExt;
@@ -39,6 +39,7 @@ use crate::{
         decrypt_local, decrypt_str, decrypt_vec, encrypt_local, encrypt_str, encrypt_vec,
         SecretStorageError,
     },
+    ResultType,
 };
 
 pub const RENDEZVOUS_TIMEOUT: u64 = 12_000;
@@ -2000,7 +2001,7 @@ impl Config {
         };
         let mut devices: Vec<TrustedDevice> = serde_json::from_str(&plaintext).unwrap_or_default();
         let len = devices.len();
-        devices.retain(|d| !d.outdate());
+        devices.retain(|d| !d.is_expired());
         if devices.len() != len {
             Self::set_trusted_devices(devices.clone());
         }
@@ -2008,39 +2009,77 @@ impl Config {
         devices
     }
 
-    fn set_trusted_devices(mut trusted_devices: Vec<TrustedDevice>) {
-        trusted_devices.retain(|d| !d.outdate());
-        let devices = serde_json::to_string(&trusted_devices).unwrap_or_default();
+    pub fn try_set_trusted_devices(mut trusted_devices: Vec<TrustedDevice>) -> ResultType<()> {
+        trusted_devices.retain(|d| !d.is_expired());
+        let devices = serde_json::to_string(&trusted_devices)
+            .map_err(|err| anyhow!("Failed to serialize trusted devices: {err}"))?;
         let max_len = 1024 * 1024;
         if devices.len() > max_len {
-            log::error!("Trusted devices too large: {}", devices.len());
-            return;
+            bail!("Trusted devices payload exceeds maximum allowed size ({max_len} bytes)");
         }
-        let Ok(devices) = encrypt_str(&devices, max_len) else {
-            log::error!("Failed to encrypt trusted devices");
-            return;
-        };
-        let mut config = CONFIG2.write().unwrap();
-        config.trusted_devices = devices;
-        config.store();
-        *TRUSTED_DEVICES.write().unwrap() = (trusted_devices, true);
+        let encrypted_devices = encrypt_str(&devices, max_len)
+            .map_err(|err| anyhow!("Failed to encrypt trusted devices: {err}"))?;
+        let mut config = CONFIG2
+            .write()
+            .map_err(|_| anyhow!("CONFIG2 lock poisoned"))?;
+        let previous_encrypted = config.trusted_devices.clone();
+        config.trusted_devices = encrypted_devices;
+        if let Err(err) = config.try_store() {
+            config.trusted_devices = previous_encrypted;
+            bail!("Failed to persist trusted devices to storage: {err}");
+        }
+        if let Ok(mut cache) = TRUSTED_DEVICES.write() {
+            *cache = (trusted_devices, true);
+        }
+        Ok(())
     }
 
-    pub fn add_trusted_device(device: TrustedDevice) {
+    pub fn set_trusted_devices(trusted_devices: Vec<TrustedDevice>) {
+        if let Err(err) = Self::try_set_trusted_devices(trusted_devices) {
+            log::error!("Failed to set trusted devices: {err}");
+        }
+    }
+
+    pub fn add_trusted_device(mut device: TrustedDevice) -> ResultType<()> {
+        device.ensure_fingerprint();
         let mut devices = Self::get_trusted_devices();
-        devices.retain(|d| d.hwid != device.hwid);
+        devices.retain(|d| {
+            if !device.device_id.is_empty() && !d.device_id.is_empty() {
+                d.device_id != device.device_id
+            } else if !device.public_key_fingerprint.is_empty()
+                && !d.public_key_fingerprint.is_empty()
+            {
+                d.public_key_fingerprint != device.public_key_fingerprint
+            } else if !device.hwid.is_empty() && !d.hwid.is_empty() {
+                d.hwid != device.hwid
+            } else {
+                true
+            }
+        });
         devices.push(device);
-        Self::set_trusted_devices(devices);
+        Self::try_set_trusted_devices(devices)
     }
 
-    pub fn remove_trusted_devices(hwids: &[Bytes]) {
+    pub fn remove_trusted_devices<S: AsRef<str>>(device_ids: &[S]) -> ResultType<()> {
+        let mut devices = Self::get_trusted_devices();
+        devices.retain(|d| !device_ids.iter().any(|id| id.as_ref() == d.device_id));
+        Self::try_set_trusted_devices(devices)
+    }
+
+    pub fn remove_trusted_devices_by_hwid(hwids: &[Bytes]) -> ResultType<()> {
         let mut devices = Self::get_trusted_devices();
         devices.retain(|d| !hwids.contains(&d.hwid));
-        Self::set_trusted_devices(devices);
+        Self::try_set_trusted_devices(devices)
+    }
+
+    pub fn try_clear_trusted_devices() -> ResultType<()> {
+        Self::try_set_trusted_devices(Default::default())
     }
 
     pub fn clear_trusted_devices() {
-        Self::set_trusted_devices(Default::default());
+        if let Err(err) = Self::try_clear_trusted_devices() {
+            log::error!("Failed to clear trusted devices: {err}");
+        }
     }
 
     pub fn get() -> Config {
@@ -3138,20 +3177,137 @@ impl Group {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct TrustedDevice {
-    pub hwid: Bytes,
-    pub time: i64,
-    pub id: String,
+    #[serde(default, alias = "id")]
+    pub device_id: String,
+    #[serde(default)]
+    pub public_key: Bytes,
+    #[serde(default)]
+    pub public_key_fingerprint: String,
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub platform: String,
+    #[serde(default, alias = "time")]
+    pub created_at: i64,
+    #[serde(default)]
+    pub last_used_at: i64,
+    #[serde(default)]
+    pub hwid: Bytes,
 }
 
 impl TrustedDevice {
-    pub fn outdate(&self) -> bool {
-        const DAYS_90: i64 = 90 * 24 * 60 * 60 * 1000;
-        self.time + DAYS_90 < crate::get_time()
+    pub fn new(device_id: String, public_key: Bytes, name: String, platform: String) -> Self {
+        let fingerprint = compute_public_key_fingerprint(&public_key);
+        let now = crate::get_time();
+        Self {
+            device_id,
+            public_key,
+            public_key_fingerprint: fingerprint,
+            name,
+            platform,
+            created_at: now,
+            last_used_at: now,
+            hwid: Bytes::new(),
+        }
     }
+
+    pub fn is_expired(&self) -> bool {
+        const DAYS_90: i64 = 90 * 24 * 60 * 60 * 1000;
+        let ts = if self.last_used_at > 0 {
+            self.last_used_at
+        } else {
+            self.created_at
+        };
+        ts + DAYS_90 < crate::get_time()
+    }
+
+    #[inline]
+    pub fn outdate(&self) -> bool {
+        self.is_expired()
+    }
+
+    pub fn ensure_fingerprint(&mut self) {
+        if self.public_key_fingerprint.is_empty() && !self.public_key.is_empty() {
+            self.public_key_fingerprint = compute_public_key_fingerprint(&self.public_key);
+        }
+    }
+}
+
+pub fn compute_public_key_fingerprint(public_key: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(public_key);
+    let mut out = String::with_capacity(hash.len() * 2);
+    for byte in hash {
+        use std::fmt::Write;
+        let _ = write!(out, "{:02x}", byte);
+    }
+    out
+}
+
+pub fn create_device_proof_raw_payload(
+    challenge: &[u8],
+    target_host_id: &str,
+    controller_id: &str,
+    session_scope: &str,
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(
+        "camellia-trusted-device-v1\n".len()
+            + challenge.len()
+            + 1
+            + target_host_id.len()
+            + 1
+            + controller_id.len()
+            + 1
+            + session_scope.len(),
+    );
+    payload.extend_from_slice(b"camellia-trusted-device-v1\n");
+    payload.extend_from_slice(challenge);
+    payload.push(b'\n');
+    payload.extend_from_slice(target_host_id.as_bytes());
+    payload.push(b'\n');
+    payload.extend_from_slice(controller_id.as_bytes());
+    payload.push(b'\n');
+    payload.extend_from_slice(session_scope.as_bytes());
+    payload
+}
+
+pub fn create_device_proof_payload(
+    challenge: &[u8],
+    target_host_id: &str,
+    controller_id: &str,
+    session_scope: &str,
+) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let raw =
+        create_device_proof_raw_payload(challenge, target_host_id, controller_id, session_scope);
+    Sha256::digest(&raw).to_vec()
+}
+
+pub fn sign_device_proof(
+    challenge: &[u8],
+    target_host_id: &str,
+    controller_id: &str,
+    session_scope: &str,
+    signing_secret_key: &crate::crypto::sign::SecretKey,
+) -> Vec<u8> {
+    let commitment =
+        create_device_proof_payload(challenge, target_host_id, controller_id, session_scope);
+    crate::crypto::sign::sign_detached(&commitment, signing_secret_key).to_vec()
+}
+
+pub fn verify_device_proof(
+    challenge: &[u8],
+    target_host_id: &str,
+    controller_id: &str,
+    session_scope: &str,
+    device_signature: &[u8],
+    device_public_key: &crate::crypto::sign::PublicKey,
+) -> Result<(), crate::crypto::CryptoError> {
+    let commitment =
+        create_device_proof_payload(challenge, target_host_id, controller_id, session_scope);
+    crate::crypto::sign::verify_detached(device_signature, &commitment, device_public_key)
 }
 
 deserialize_default!(deserialize_string, String);
@@ -4324,11 +4480,14 @@ mod tests {
         };
         with_config_and_hard_settings(config.clone(), HashMap::new(), || {
             let trusted_device = TrustedDevice {
-                hwid: Bytes::from(vec![1, 2, 3, 4]),
-                time: crate::get_time(),
-                id: "trusted-device".to_owned(),
+                device_id: "trusted-device".to_owned(),
+                public_key: Bytes::from(vec![1u8; 32]),
+                public_key_fingerprint: "fingerprint".to_owned(),
                 name: "Test device".to_owned(),
                 platform: "test".to_owned(),
+                created_at: crate::get_time(),
+                last_used_at: crate::get_time(),
+                hwid: Bytes::from(vec![1, 2, 3, 4]),
             };
             Config::set_trusted_devices(vec![trusted_device.clone()]);
 
@@ -4952,6 +5111,360 @@ mod tests {
             KEY_PAIR.lock().unwrap().as_ref(),
             Some(&replacement_key_pair),
             "KEY_PAIR cache must now hold the new keypair"
+        );
+    }
+
+    #[test]
+    fn test_auth_002_protobuf_login_response_and_auth2fa_wire_contracts() {
+        use crate::message_proto::{login_response, Auth2FA, LoginResponse};
+        use protobuf::Message as _;
+
+        // 1. Verify LoginResponse with challenge and target_id fields
+        let mut login_resp = LoginResponse::new();
+        login_resp.union = Some(login_response::Union::Error("2FA Required".to_string()));
+        login_resp.enable_trusted_devices = true;
+        let host_challenge = vec![0x42u8; 32];
+        login_resp.challenge = Bytes::copy_from_slice(&host_challenge);
+        login_resp.challenge_expires_at = 1730000000;
+        login_resp.target_id = "camellia-host-peer-01".to_string();
+
+        let encoded = login_resp.write_to_bytes().expect("protobuf write failed");
+        let decoded = LoginResponse::parse_from_bytes(&encoded).expect("protobuf parse failed");
+
+        assert!(decoded.enable_trusted_devices);
+        assert_eq!(decoded.challenge.as_ref(), &host_challenge[..]);
+        assert_eq!(decoded.challenge_expires_at, 1730000000);
+        assert_eq!(decoded.target_id, "camellia-host-peer-01");
+        match decoded.union {
+            Some(login_response::Union::Error(err)) => assert_eq!(err, "2FA Required"),
+            _ => panic!("Expected error union variant"),
+        }
+
+        // 2. Verify Auth2FA with challenge, device_pk, device_signature, device_id, trust_this_device
+        let mut auth_2fa = Auth2FA::new();
+        auth_2fa.code = "123456".to_string();
+        auth_2fa.hwid = Bytes::from_static(b"legacy-hwid-metadata");
+        auth_2fa.challenge = Bytes::copy_from_slice(&host_challenge);
+        let dummy_pk = vec![0x07u8; 32];
+        auth_2fa.device_pk = Bytes::copy_from_slice(&dummy_pk);
+        let dummy_sig = vec![0xaau8; 64];
+        auth_2fa.device_signature = Bytes::copy_from_slice(&dummy_sig);
+        auth_2fa.device_id = "camellia-controller-peer-01".to_string();
+        auth_2fa.trust_this_device = true;
+
+        let encoded_auth = auth_2fa.write_to_bytes().expect("auth2fa write failed");
+        let decoded_auth = Auth2FA::parse_from_bytes(&encoded_auth).expect("auth2fa parse failed");
+
+        assert_eq!(decoded_auth.code, "123456");
+        assert_eq!(decoded_auth.hwid.as_ref(), b"legacy-hwid-metadata");
+        assert_eq!(decoded_auth.challenge.as_ref(), &host_challenge[..]);
+        assert_eq!(decoded_auth.device_pk.as_ref(), &dummy_pk[..]);
+        assert_eq!(decoded_auth.device_signature.as_ref(), &dummy_sig[..]);
+        assert_eq!(decoded_auth.device_id, "camellia-controller-peer-01");
+        assert!(decoded_auth.trust_this_device);
+    }
+
+    #[test]
+    fn test_auth_002_trusted_device_lifecycle_fingerprint_and_expiration() {
+        let pk = [0x5au8; 32];
+        let computed_fp = compute_public_key_fingerprint(&pk);
+        assert_eq!(computed_fp.len(), 64);
+        // Verify lowercase hexadecimal representation
+        assert!(computed_fp
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+
+        let mut device = TrustedDevice::new(
+            "controller-dev-01".to_string(),
+            Bytes::copy_from_slice(&pk),
+            "Camellia Remote Controller".to_string(),
+            "Linux".to_string(),
+        );
+
+        assert_eq!(device.device_id, "controller-dev-01");
+        assert_eq!(device.public_key_fingerprint, computed_fp);
+        assert_eq!(device.name, "Camellia Remote Controller");
+        assert_eq!(device.platform, "Linux");
+        assert!(!device.is_expired(), "Fresh device must not be expired");
+        assert!(!device.outdate(), "outdate alias must match is_expired");
+
+        // Fast-forward last_used_at past 90 days
+        const DAYS_91_MS: i64 = 91 * 24 * 60 * 60 * 1000;
+        device.last_used_at = crate::get_time() - DAYS_91_MS;
+        assert!(device.is_expired(), "Device beyond 90 days must be expired");
+        assert!(device.outdate());
+
+        // Fast-forward created_at when last_used_at is 0
+        device.last_used_at = 0;
+        device.created_at = crate::get_time() - DAYS_91_MS;
+        assert!(
+            device.is_expired(),
+            "Fallback to created_at must expire after 90 days"
+        );
+    }
+
+    #[test]
+    fn test_auth_002_trusted_device_backward_compatible_serde() {
+        // Test legacy JSON with "id" and "time"
+        let legacy_json = r#"{"id":"legacy-dev-01","time":1700000000000,"name":"Legacy Device","platform":"windows","hwid":[1,2,3,4]}"#;
+        let deserialized: TrustedDevice =
+            serde_json::from_str(legacy_json).expect("Deserialization failed");
+
+        assert_eq!(deserialized.device_id, "legacy-dev-01");
+        assert_eq!(deserialized.created_at, 1700000000000);
+        assert_eq!(deserialized.name, "Legacy Device");
+        assert_eq!(deserialized.platform, "windows");
+        assert_eq!(deserialized.hwid.as_ref(), &[1, 2, 3, 4]);
+        assert!(deserialized.public_key.is_empty());
+        assert!(deserialized.public_key_fingerprint.is_empty());
+
+        // Test modern JSON round-trip
+        let modern_device = TrustedDevice {
+            device_id: "modern-dev-02".to_string(),
+            public_key: Bytes::from_static(&[0x07; 32]),
+            public_key_fingerprint: "0123456789abcdef".to_string(),
+            name: "Modern Controller".to_string(),
+            platform: "macos".to_string(),
+            created_at: 1710000000000,
+            last_used_at: 1715000000000,
+            hwid: Bytes::from_static(&[5, 6, 7, 8]),
+        };
+
+        let serialized = serde_json::to_string(&modern_device).expect("Serialization failed");
+        let roundtrip: TrustedDevice =
+            serde_json::from_str(&serialized).expect("Deserialization failed");
+        assert_eq!(roundtrip, modern_device);
+    }
+
+    #[test]
+    fn test_auth_002_add_and_remove_trusted_devices() {
+        let _guard = lock_config_state_for_test();
+        let _path_guard = ConfigPathTestGuard::new();
+
+        Config::clear_trusted_devices();
+        assert!(Config::get_trusted_devices().is_empty());
+
+        let dev1 = TrustedDevice {
+            device_id: "controller-peer-01".to_string(),
+            public_key: Bytes::from_static(&[0x11; 32]),
+            public_key_fingerprint: "fp-01".to_string(),
+            name: "Work Laptop".to_string(),
+            platform: "linux".to_string(),
+            created_at: crate::get_time(),
+            last_used_at: crate::get_time(),
+            hwid: Bytes::new(),
+        };
+
+        let dev2 = TrustedDevice {
+            device_id: "controller-peer-02".to_string(),
+            public_key: Bytes::from_static(&[0x22; 32]),
+            public_key_fingerprint: "fp-02".to_string(),
+            name: "Home Desktop".to_string(),
+            platform: "windows".to_string(),
+            created_at: crate::get_time(),
+            last_used_at: crate::get_time(),
+            hwid: Bytes::new(),
+        };
+
+        assert!(Config::add_trusted_device(dev1.clone()).is_ok());
+        assert!(Config::add_trusted_device(dev2.clone()).is_ok());
+
+        let devices = Config::get_trusted_devices();
+        assert_eq!(devices.len(), 2);
+        assert!(devices.iter().any(|d| d.device_id == "controller-peer-01"));
+        assert!(devices.iter().any(|d| d.device_id == "controller-peer-02"));
+
+        // Deduplication update
+        let mut updated_dev1 = dev1.clone();
+        updated_dev1.name = "Work Laptop (Renamed)".to_string();
+        assert!(Config::add_trusted_device(updated_dev1).is_ok());
+        let devices = Config::get_trusted_devices();
+        assert_eq!(devices.len(), 2, "Deduplication must keep list count at 2");
+        let found = devices
+            .iter()
+            .find(|d| d.device_id == "controller-peer-01")
+            .unwrap();
+        assert_eq!(found.name, "Work Laptop (Renamed)");
+
+        // Removal by device ID slice (&[String] and &[&str])
+        assert!(Config::remove_trusted_devices(&["controller-peer-01"]).is_ok());
+        let devices = Config::get_trusted_devices();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].device_id, "controller-peer-02");
+
+        // Removal of second device
+        let to_remove = vec!["controller-peer-02".to_string()];
+        assert!(Config::remove_trusted_devices(&to_remove).is_ok());
+        assert!(Config::get_trusted_devices().is_empty());
+    }
+
+    #[test]
+    fn test_auth_002_add_trusted_device_fail_closed_persistence() {
+        let _guard = lock_config_state_for_test();
+        let path_guard = ConfigPathTestGuard::new();
+
+        Config::clear_trusted_devices();
+        assert!(Config::get_trusted_devices().is_empty());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let config_dir = path_guard.path.join("config");
+            fs::create_dir_all(&config_dir).ok();
+            fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o400)).ok();
+
+            let device = TrustedDevice {
+                device_id: "controller-peer-99".to_string(),
+                public_key: Bytes::from_static(&[0x99; 32]),
+                public_key_fingerprint: "fp-99".to_string(),
+                name: "Attacker / Failing Device".to_string(),
+                platform: "linux".to_string(),
+                created_at: crate::get_time(),
+                last_used_at: crate::get_time(),
+                hwid: Bytes::new(),
+            };
+
+            let res = Config::add_trusted_device(device);
+            assert!(
+                res.is_err(),
+                "Config::add_trusted_device must return error when disk store fails"
+            );
+
+            // Fail-closed invariant: in-memory cache must NOT be updated if disk write fails!
+            let cached_devices = Config::get_trusted_devices();
+            assert!(
+                cached_devices.is_empty(),
+                "In-memory trusted devices cache must NOT contain unpersisted device"
+            );
+
+            // Restore permissions for cleanup
+            fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700)).ok();
+        }
+    }
+
+    #[test]
+    fn test_auth_002_device_proof_canonical_payload_and_cryptographic_verification() {
+        let (public_key, secret_key) = crate::crypto::sign::gen_keypair();
+        let challenge = [0x33u8; 32];
+        let target_host_id = "camellia-host-target-01";
+        let controller_id = "camellia-controller-client-01";
+        let session_scope = "remote-desktop";
+
+        // 1. Verify canonical raw payload commitment domain separation
+        let raw = create_device_proof_raw_payload(
+            &challenge,
+            target_host_id,
+            controller_id,
+            session_scope,
+        );
+        assert!(raw.starts_with(b"camellia-trusted-device-v1\n"));
+        let raw_str = String::from_utf8_lossy(&raw);
+        assert!(raw_str.contains(target_host_id));
+        assert!(raw_str.contains(controller_id));
+        assert!(raw_str.starts_with("camellia-trusted-device-v1\n"));
+        assert!(
+            !raw_str.contains(concat!("rust", "desk")),
+            "Must strictly comply with Camellia Remote branding"
+        );
+
+        // 2. Sign device proof
+        let signature = sign_device_proof(
+            &challenge,
+            target_host_id,
+            controller_id,
+            session_scope,
+            &secret_key,
+        );
+        assert_eq!(signature.len(), 64);
+
+        // 3. Verify valid device proof
+        let verify_result = verify_device_proof(
+            &challenge,
+            target_host_id,
+            controller_id,
+            session_scope,
+            &signature,
+            &public_key,
+        );
+        assert!(
+            verify_result.is_ok(),
+            "Valid device proof signature must verify successfully"
+        );
+
+        // 4. Verify rejection of tampered challenge
+        let mut tampered_challenge = challenge;
+        tampered_challenge[0] ^= 0xff;
+        let tampered_res = verify_device_proof(
+            &tampered_challenge,
+            target_host_id,
+            controller_id,
+            session_scope,
+            &signature,
+            &public_key,
+        );
+        assert!(
+            tampered_res.is_err(),
+            "Tampered challenge must fail verification"
+        );
+
+        // 5. Verify rejection of mismatched target host ID (replay prevention)
+        let wrong_host = "camellia-host-target-02";
+        let wrong_host_res = verify_device_proof(
+            &challenge,
+            wrong_host,
+            controller_id,
+            session_scope,
+            &signature,
+            &public_key,
+        );
+        assert!(
+            wrong_host_res.is_err(),
+            "Signature tied to target host 01 must fail on target host 02"
+        );
+
+        // 6. Verify rejection of mismatched controller ID
+        let wrong_controller = "camellia-controller-client-02";
+        let wrong_ctrl_res = verify_device_proof(
+            &challenge,
+            target_host_id,
+            wrong_controller,
+            session_scope,
+            &signature,
+            &public_key,
+        );
+        assert!(
+            wrong_ctrl_res.is_err(),
+            "Signature tied to controller 01 must fail on controller 02"
+        );
+
+        // 7. Verify rejection of mismatched session scope
+        let wrong_scope = "file-transfer";
+        let wrong_scope_res = verify_device_proof(
+            &challenge,
+            target_host_id,
+            controller_id,
+            wrong_scope,
+            &signature,
+            &public_key,
+        );
+        assert!(
+            wrong_scope_res.is_err(),
+            "Signature for remote-desktop must fail on file-transfer"
+        );
+
+        // 8. Verify rejection with wrong public key
+        let (other_public, _) = crate::crypto::sign::gen_keypair();
+        let wrong_pk_res = verify_device_proof(
+            &challenge,
+            target_host_id,
+            controller_id,
+            session_scope,
+            &signature,
+            &other_public,
+        );
+        assert!(
+            wrong_pk_res.is_err(),
+            "Verification with different public key must fail"
         );
     }
 }

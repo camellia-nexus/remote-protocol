@@ -98,6 +98,11 @@ message Terminal {
 message Auth2FA {
   string code = 1;
   bytes hwid = 2;
+  bytes challenge = 3;
+  bytes device_pk = 4;
+  bytes device_signature = 5;
+  string device_id = 6;
+  bool trust_this_device = 7;
 }
 
 message ChatMessage { string text = 1; }
@@ -152,6 +157,9 @@ message LoginResponse {
     PeerInfo peer_info = 2;
   }
   bool enable_trusted_devices = 3;
+  bytes challenge = 4;
+  int64 challenge_expires_at = 5;
+  string target_id = 6;
 }
 
 message TouchScaleUpdate {

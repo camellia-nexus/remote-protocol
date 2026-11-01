@@ -237,6 +237,32 @@ pub mod sign {
             .map_err(|_| CryptoError::Authentication)?;
         Ok(message.to_vec())
     }
+
+    pub fn sign_detached(message: &[u8], key: &SecretKey) -> [u8; SIGNATUREBYTES] {
+        let mut seed = [0u8; SEEDBYTES];
+        seed.copy_from_slice(&key.0[..SEEDBYTES]);
+        let signing_key = SigningKey::from_bytes(&seed);
+        let signature: Signature = signing_key.sign(message);
+        signature.to_bytes()
+    }
+
+    pub fn verify_detached(
+        signature: &[u8],
+        message: &[u8],
+        key: &PublicKey,
+    ) -> Result<(), CryptoError> {
+        if signature.len() != SIGNATUREBYTES {
+            return Err(CryptoError::Authentication);
+        }
+        let verifying_key =
+            VerifyingKey::from_bytes(&key.0).map_err(|_| CryptoError::Authentication)?;
+        let signature =
+            Signature::from_slice(signature).map_err(|_| CryptoError::Authentication)?;
+        verifying_key
+            .verify_strict(message, &signature)
+            .map_err(|_| CryptoError::Authentication)?;
+        Ok(())
+    }
 }
 
 #[inline]
@@ -328,5 +354,27 @@ mod tests {
         assert!(constant_time_eq(b"same", b"same"));
         assert!(!constant_time_eq(b"same", b"diff"));
         assert!(!constant_time_eq(b"same", b"same-longer"));
+    }
+
+    #[test]
+    fn ed25519_detached_signatures_verify_authenticity() {
+        let (public, secret) = sign::gen_keypair();
+        let message = b"camellia-trusted-device-proof-test";
+        let signature = sign::sign_detached(message, &secret);
+        assert_eq!(signature.len(), 64);
+        assert!(sign::verify_detached(&signature, message, &public).is_ok());
+
+        // Tampered message
+        let tampered_msg = b"camellia-trusted-device-proof-t3st";
+        assert!(sign::verify_detached(&signature, tampered_msg, &public).is_err());
+
+        // Tampered signature
+        let mut tampered_sig = signature;
+        tampered_sig[0] ^= 0x01;
+        assert!(sign::verify_detached(&tampered_sig, message, &public).is_err());
+
+        // Wrong key
+        let (other_public, _) = sign::gen_keypair();
+        assert!(sign::verify_detached(&signature, message, &other_public).is_err());
     }
 }
