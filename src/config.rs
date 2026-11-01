@@ -243,7 +243,7 @@ pub enum NetworkType {
     ProxySocks,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Default, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Config {
     #[serde(
         default,
@@ -263,6 +263,63 @@ pub struct Config {
     key_confirmed: bool,
     #[serde(default, deserialize_with = "deserialize_hashmap_string_bool")]
     keys_confirmed: HashMap<String, bool>,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (sk_desc, pk_desc) = if self.key_pair.0.is_empty() {
+            (
+                "<empty>",
+                if self.key_pair.1.is_empty() {
+                    "<empty>"
+                } else {
+                    "<present>"
+                },
+            )
+        } else {
+            (
+                "<redacted>",
+                if self.key_pair.1.is_empty() {
+                    "<empty>"
+                } else {
+                    "<present>"
+                },
+            )
+        };
+        f.debug_struct("Config")
+            .field("id", &self.id)
+            .field(
+                "enc_id",
+                &if self.enc_id.is_empty() {
+                    "<empty>"
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field(
+                "password",
+                &if self.password.is_empty() {
+                    "<empty>"
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field(
+                "salt",
+                &if self.salt.is_empty() {
+                    "<empty>"
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field(
+                "key_pair",
+                &format_args!("(sk: {}, pk: {})", sk_desc, pk_desc),
+            )
+            .field("key_confirmed", &self.key_confirmed)
+            .field("keys_confirmed", &self.keys_confirmed)
+            .finish()
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize, Clone)]
@@ -788,21 +845,91 @@ pub fn load_path<T: serde::Serialize + serde::de::DeserializeOwned + Default + s
     cfg
 }
 
+pub fn store_path_durable<T: serde::Serialize>(
+    path: impl AsRef<Path>,
+    cfg: &T,
+) -> crate::ResultType<()> {
+    let path = path.as_ref();
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("Path has no parent directory: {:?}", path))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        builder.mode(0o700);
+        let _ = builder.create(parent);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    let content = toml::to_string_pretty(cfg)
+        .map_err(|err| anyhow!("Failed to serialize config to TOML: {err}"))?;
+
+    let rand_id: u64 = rand::random();
+    let temp_file_name = format!(
+        ".{}_{}_{:x}.tmp",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("config"),
+        std::process::id(),
+        rand_id
+    );
+    let temp_path = parent.join(temp_file_name);
+
+    let write_res = (|| -> std::io::Result<()> {
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&temp_path)?
+        };
+        #[cfg(not(unix))]
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temp_path)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+        }
+
+        use std::io::Write;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+
+        fs::rename(&temp_path, path)?;
+
+        #[cfg(unix)]
+        {
+            if let Ok(dir) = fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = write_res {
+        let _ = fs::remove_file(&temp_path);
+        return Err(anyhow!("Failed to durably store config at {:?}: {e}", path));
+    }
+
+    Ok(())
+}
+
 #[inline]
 pub fn store_path<T: serde::Serialize>(path: PathBuf, cfg: T) -> crate::ResultType<()> {
-    #[cfg(not(windows))]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        Ok(confy::store_path_perms(
-            path,
-            cfg,
-            fs::Permissions::from_mode(0o600),
-        )?)
-    }
-    #[cfg(windows)]
-    {
-        Ok(confy::store_path(path, cfg)?)
-    }
+    store_path_durable(&path, &cfg)
 }
 
 impl Config {
@@ -810,11 +937,10 @@ impl Config {
         suffix: &str,
     ) -> T {
         let file = Self::file_(suffix);
-        let cfg = load_path(file);
         if suffix.is_empty() {
-            log::trace!("{:?}", cfg);
+            log::trace!("Loading main configuration from {}", file.display());
         }
-        cfg
+        load_path(file)
     }
 
     fn store_<T: serde::Serialize>(config: &T, suffix: &str) {
@@ -907,18 +1033,28 @@ impl Config {
         }
     }
 
-    fn store(&self) {
+    pub fn try_store(&self) -> Result<()> {
         let mut config = self.clone();
         Self::prepare_config_for_store(&mut config);
+        if config.key_pair.0.is_empty() {
+            if let Some(kp) = KEY_PAIR.lock().unwrap().as_ref() {
+                config.key_pair = kp.clone();
+            }
+        }
         if decrypt_str(&config.enc_id).as_deref() != Ok(config.id.as_str()) {
-            let Ok(enc_id) = encrypt_str(&config.id, ENCRYPT_MAX_LEN) else {
-                log::error!("Refusing to store config because the device ID cannot be encrypted");
-                return;
-            };
+            let enc_id = encrypt_str(&config.id, ENCRYPT_MAX_LEN).map_err(|err| {
+                anyhow!("Refusing to store config because the device ID cannot be encrypted: {err}")
+            })?;
             config.enc_id = enc_id;
         }
         config.id = "".to_owned();
-        Config::store_(&config, "");
+        Self::try_store_(&config, "")
+    }
+
+    fn store(&self) {
+        if let Err(err) = self.try_store() {
+            log::error!("Failed to store Config: {err}");
+        }
     }
 
     pub fn file() -> PathBuf {
@@ -1313,16 +1449,27 @@ impl Config {
         if config.key_pair.0.is_empty() {
             log::info!("Generated new keypair for id: {}", config.id);
             let (pk, sk) = sign::gen_keypair();
-            let key_pair = (sk.0.to_vec(), pk.0.into());
+            let key_pair: KeyPair = (sk.0.to_vec(), pk.0.into());
             config.key_pair = key_pair.clone();
-            std::thread::spawn(|| {
-                let mut config = CONFIG.write().unwrap();
-                config.key_pair = key_pair;
-                config.store();
-            });
+            let file = Config::file_("");
+            if let Err(err) = store_path_durable(&file, &config) {
+                log::error!(
+                    "Failed to durably persist generated keypair to {}: {err}",
+                    file.display()
+                );
+                return (Vec::new(), Vec::new());
+            }
+            log::info!("Successfully persisted new keypair to {}", file.display());
+            *lock = Some(key_pair.clone());
+            return key_pair;
         }
         *lock = Some(config.key_pair.clone());
         config.key_pair
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_key_pair_cache_for_test() {
+        *KEY_PAIR.lock().unwrap() = None;
     }
 
     pub fn get_cached_pk() -> Option<Vec<u8>> {
@@ -1908,10 +2055,8 @@ impl Config {
         *lock = cfg;
         lock.store();
         // Drop CONFIG lock before acquiring KEY_PAIR lock to avoid potential deadlock.
-        #[cfg(target_os = "macos")]
         let new_key_pair = lock.key_pair.clone();
         drop(lock);
-        #[cfg(target_os = "macos")]
         Self::invalidate_key_pair_cache_if_changed(&new_key_pair);
         if permanent_credentials_changed {
             Self::clear_trusted_devices();
@@ -1924,8 +2069,10 @@ impl Config {
     /// If we use Some with an empty key_pair, get_key_pair() would always return
     /// the empty key_pair from cache without regenerating.
     /// By clearing the cache, get_key_pair() will reload and regenerate if needed.
-    #[cfg(target_os = "macos")]
     fn invalidate_key_pair_cache_if_changed(new_key_pair: &KeyPair) {
+        if new_key_pair.0.is_empty() {
+            return;
+        }
         let mut key_pair_cache = KEY_PAIR.lock().unwrap();
         if let Some(cached) = key_pair_cache.as_ref() {
             if cached != new_key_pair {
@@ -3578,6 +3725,7 @@ mod tests {
         original_default_settings: HashMap<String, String>,
         original_overwrite_settings: HashMap<String, String>,
         original_trusted_devices: (Vec<TrustedDevice>, bool),
+        original_key_pair: Option<KeyPair>,
     }
 
     struct ConfigPathTestGuard {
@@ -3595,6 +3743,7 @@ mod tests {
             let original_default_settings = DEFAULT_SETTINGS.read().unwrap().clone();
             let original_overwrite_settings = OVERWRITE_SETTINGS.read().unwrap().clone();
             let original_trusted_devices = TRUSTED_DEVICES.read().unwrap().clone();
+            let original_key_pair = KEY_PAIR.lock().unwrap().clone();
             *CONFIG.write().unwrap() = config;
             *CONFIG2.write().unwrap() = Config2::default();
             *HARD_SETTINGS.write().unwrap() = hard_settings;
@@ -3606,6 +3755,7 @@ mod tests {
                 original_default_settings,
                 original_overwrite_settings,
                 original_trusted_devices,
+                original_key_pair,
             }
         }
     }
@@ -3618,6 +3768,7 @@ mod tests {
             *DEFAULT_SETTINGS.write().unwrap() = self.original_default_settings.clone();
             *OVERWRITE_SETTINGS.write().unwrap() = self.original_overwrite_settings.clone();
             *TRUSTED_DEVICES.write().unwrap() = self.original_trusted_devices.clone();
+            *KEY_PAIR.lock().unwrap() = self.original_key_pair.clone();
         }
     }
 
@@ -4617,5 +4768,188 @@ mod tests {
         let non_service_root = Config::ipc_path_for_uid(ROOT_UID, "");
         let non_service_user = Config::ipc_path_for_uid(USER_UID, "");
         assert_ne!(non_service_root, non_service_user);
+    }
+
+    #[test]
+    fn test_log_002_config_debug_redaction() {
+        let mut cfg = Config::default();
+        cfg.id = "device_test_id_12345".to_string();
+        cfg.enc_id = "ENC_ID_CANARY_SECRET_DATA".to_string();
+        cfg.password = "PASSWORD_CANARY_HASH_DATA".to_string();
+        cfg.salt = "SALT_CANARY_RANDOM_BITS".to_string();
+        cfg.key_pair = (
+            b"PRIVATE_KEY_CANARY_32_BYTES_OF_RAW_ENTROPY!".to_vec(),
+            b"PUBLIC_KEY_CANARY_32_BYTES_OF_PUBLIC_DATA!".to_vec(),
+        );
+        cfg.key_confirmed = true;
+        cfg.keys_confirmed
+            .insert("peer_host_test".to_string(), true);
+
+        let debug_output = format!("{:?}", cfg);
+
+        // Assert sensitive secrets are NEVER leaked in Debug formatting
+        assert!(
+            !debug_output.contains("PRIVATE_KEY_CANARY"),
+            "Private key was leaked in Debug output!"
+        );
+        assert!(
+            !debug_output.contains("PASSWORD_CANARY"),
+            "Password was leaked in Debug output!"
+        );
+        assert!(
+            !debug_output.contains("SALT_CANARY"),
+            "Salt was leaked in Debug output!"
+        );
+        assert!(
+            !debug_output.contains("ENC_ID_CANARY"),
+            "Encrypted ID was leaked in Debug output!"
+        );
+
+        // Assert redaction markers are present
+        assert!(
+            debug_output.contains("<redacted>"),
+            "Redaction marker missing from Debug output!"
+        );
+
+        // Assert non-secret fields remain visible for diagnostics
+        assert!(
+            debug_output.contains("device_test_id_12345"),
+            "ID should remain visible!"
+        );
+        assert!(
+            debug_output.contains("key_confirmed: true"),
+            "Key confirmed status should remain visible!"
+        );
+    }
+
+    #[test]
+    fn test_config_001_durable_keypair_persistence() {
+        let _guard = lock_config_state_for_test();
+        let _path_guard = ConfigPathTestGuard::new();
+        Config::reset_key_pair_cache_for_test();
+
+        let config_file = Config::file_("");
+        assert!(
+            !config_file.exists(),
+            "Config file must not exist before test"
+        );
+
+        // Calling get_key_pair() should generate and durably persist
+        let key_pair = Config::get_key_pair();
+        assert!(
+            !key_pair.0.is_empty(),
+            "Generated secret key must not be empty"
+        );
+        assert!(
+            !key_pair.1.is_empty(),
+            "Generated public key must not be empty"
+        );
+
+        // The file must now exist on disk
+        assert!(
+            config_file.exists(),
+            "Config file must exist after get_key_pair"
+        );
+
+        // Verify file permissions on Unix (0600)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = fs::metadata(&config_file).expect("File metadata must be accessible");
+            let mode = meta.permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "Config file permissions must be 0600, got {:o}",
+                mode
+            );
+        }
+
+        // Read directly from disk without using in-memory cache
+        let raw_disk_config = Config::load_::<Config>("");
+        assert_eq!(
+            raw_disk_config.key_pair, key_pair,
+            "Persisted keypair on disk must match the returned keypair"
+        );
+
+        // Verify that subsequent get_key_pair() returns the cached keypair
+        let cached_key_pair = Config::get_key_pair();
+        assert_eq!(
+            cached_key_pair, key_pair,
+            "Cached keypair must match generated keypair"
+        );
+    }
+
+    #[test]
+    fn test_config_001_fail_closed_when_persistence_fails() {
+        let _guard = lock_config_state_for_test();
+        let path_guard = ConfigPathTestGuard::new();
+        Config::reset_key_pair_cache_for_test();
+
+        // Make the directory read-only so write will fail
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let config_dir = path_guard.path.join("config");
+            fs::create_dir_all(&config_dir).ok();
+            fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o400)).ok();
+
+            let key_pair = Config::get_key_pair();
+            // Persistence failed, so it must fail closed: return empty keypair and NOT cache
+            assert!(
+                key_pair.0.is_empty() && key_pair.1.is_empty(),
+                "Must fail closed by returning empty keypair when persistence fails"
+            );
+            assert!(
+                KEY_PAIR.lock().unwrap().is_none(),
+                "Must NOT cache unpersisted keypair in KEY_PAIR lock"
+            );
+
+            // Restore permissions for cleanup
+            fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700)).ok();
+        }
+    }
+
+    #[test]
+    fn test_config_004_key_pair_cache_invalidation_across_platforms() {
+        let _guard = lock_config_state_for_test();
+        let _path_guard = ConfigPathTestGuard::new();
+        Config::reset_key_pair_cache_for_test();
+
+        // 1. Initial keypair generation and caching
+        let initial_key_pair = Config::get_key_pair();
+        assert_eq!(
+            KEY_PAIR.lock().unwrap().as_ref(),
+            Some(&initial_key_pair),
+            "KEY_PAIR must be cached after get_key_pair"
+        );
+
+        // 2. Generate a new, different keypair
+        let (new_pk, new_sk) = sign::gen_keypair();
+        let replacement_key_pair: KeyPair = (new_sk.0.to_vec(), new_pk.0.into());
+        assert_ne!(initial_key_pair, replacement_key_pair);
+
+        // 3. Update configuration via Config::set with the replacement keypair
+        let mut new_config = Config::get();
+        new_config.key_pair = replacement_key_pair.clone();
+        let changed = Config::set(new_config);
+        assert!(changed, "Config::set must return true when config changed");
+
+        // 4. Assert KEY_PAIR cache was invalidated (must be None) on all platforms!
+        assert!(
+            KEY_PAIR.lock().unwrap().is_none(),
+            "KEY_PAIR cache must be invalidated after Config::set with different keypair"
+        );
+
+        // 5. Subsequent call to get_key_pair() should reload and return the new replacement keypair
+        let reloaded_key_pair = Config::get_key_pair();
+        assert_eq!(
+            reloaded_key_pair, replacement_key_pair,
+            "get_key_pair must return newly synced keypair, not stale cached keypair"
+        );
+        assert_eq!(
+            KEY_PAIR.lock().unwrap().as_ref(),
+            Some(&replacement_key_pair),
+            "KEY_PAIR cache must now hold the new keypair"
+        );
     }
 }
