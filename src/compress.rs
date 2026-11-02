@@ -6,6 +6,11 @@ use zstd::bulk::Compressor;
 
 pub(crate) const MAX_DECOMPRESSED_SIZE: usize = 256 * 1024 * 1024;
 
+/// Maximum allowed decompressed byte budget for terminal responses (128 KiB).
+/// Normal chunks are 4 KiB and replay buffer default is 8 KiB. Capping at 128 KiB
+/// prevents compression bomb memory exhaustion while allowing full output chunks.
+pub const MAX_TERMINAL_DECOMPRESSED_SIZE: usize = 128 * 1024;
+
 // The library supports regular compression levels from 1 up to ZSTD_maxCLevel(),
 // which is currently 22. Levels >= 20
 // Default level is ZSTD_CLEVEL_DEFAULT==3.
@@ -33,7 +38,7 @@ pub fn decompress(data: &[u8]) -> io::Result<Vec<u8>> {
     decompress_with_limit(data, MAX_DECOMPRESSED_SIZE)
 }
 
-pub(crate) fn decompress_with_limit(data: &[u8], limit: usize) -> io::Result<Vec<u8>> {
+pub fn decompress_with_limit(data: &[u8], limit: usize) -> io::Result<Vec<u8>> {
     let decoder = zstd::Decoder::new(data)?;
     let mut output = Vec::new();
     decoder
@@ -56,6 +61,32 @@ mod tests {
     fn rejects_data_larger_than_limit() {
         let compressed = zstd::encode_all(&vec![0u8; 1025][..], 0).unwrap();
         assert!(decompress_with_limit(&compressed, 1024).is_err());
+    }
+
+    #[test]
+    fn test_res026_terminal_decompression_limit_and_bomb_rejection() {
+        assert_eq!(MAX_TERMINAL_DECOMPRESSED_SIZE, 128 * 1024);
+
+        // Payload within terminal limit
+        let payload = vec![b'x'; MAX_TERMINAL_DECOMPRESSED_SIZE];
+        let compressed = zstd::encode_all(&payload[..], 0).unwrap();
+        let decompressed =
+            decompress_with_limit(&compressed, MAX_TERMINAL_DECOMPRESSED_SIZE).unwrap();
+        assert_eq!(decompressed.len(), MAX_TERMINAL_DECOMPRESSED_SIZE);
+
+        // Compression bomb: highly compressible 1 MiB payload into tiny compressed frame
+        let bomb = vec![0u8; 1024 * 1024]; // 1 MiB zeros
+        let compressed_bomb = zstd::encode_all(&bomb[..], 0).unwrap();
+        let result = decompress_with_limit(&compressed_bomb, MAX_TERMINAL_DECOMPRESSED_SIZE);
+        assert!(
+            result.is_err(),
+            "Decompression exceeding MAX_TERMINAL_DECOMPRESSED_SIZE must fail closed"
+        );
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err
+            .to_string()
+            .contains("decompressed data exceeds size limit"));
     }
 
     #[test]
