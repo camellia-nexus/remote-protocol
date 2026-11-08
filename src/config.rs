@@ -1643,7 +1643,7 @@ impl Config {
         option2bool(k, &Self::get_option(k))
     }
 
-    pub fn set_option(k: String, v: String) {
+    pub fn try_set_option(k: String, v: String) -> ResultType<()> {
         if CONFIG2
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1651,24 +1651,39 @@ impl Config {
             .options
             .contains_key(&k)
         {
-            return;
+            return Ok(());
         }
         if !is_option_can_save(&OVERWRITE_SETTINGS, &k, &DEFAULT_SETTINGS, &v) {
             let mut config = CONFIG2.write().unwrap();
+            let previous = config.options.clone();
             if config.options.remove(&k).is_some() {
-                config.store();
+                if let Err(err) = config.try_store() {
+                    config.options = previous;
+                    return Err(err);
+                }
             }
-            return;
+            return Ok(());
         }
         let mut config = CONFIG2.write().unwrap();
         let v2 = if v.is_empty() { None } else { Some(&v) };
         if v2 != config.options.get(&k) {
+            let previous = config.options.clone();
             if v2.is_none() {
                 config.options.remove(&k);
             } else {
                 config.options.insert(k, v);
             }
-            config.store();
+            if let Err(err) = config.try_store() {
+                config.options = previous;
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn set_option(k: String, v: String) {
+        if let Err(err) = Self::try_set_option(k, v) {
+            log::error!("Failed to set option: {err}");
         }
     }
 
@@ -2096,6 +2111,33 @@ impl Config {
     pub fn clear_trusted_devices() {
         if let Err(err) = Self::try_clear_trusted_devices() {
             log::error!("Failed to clear trusted devices: {err}");
+        }
+    }
+
+    pub fn try_disable_2fa_and_clear_trusted_devices() -> ResultType<()> {
+        let mut config = CONFIG2.write().unwrap();
+        let prev_options = config.options.clone();
+        let prev_trusted = config.trusted_devices.clone();
+
+        config.options.remove("2fa");
+        config.options.remove("bot");
+        config.trusted_devices = String::new();
+
+        if let Err(err) = config.try_store() {
+            config.options = prev_options;
+            config.trusted_devices = prev_trusted;
+            return Err(err);
+        }
+
+        if let Ok(mut cache) = TRUSTED_DEVICES.write() {
+            *cache = (Vec::new(), true);
+        }
+        Ok(())
+    }
+
+    pub fn disable_2fa_and_clear_trusted_devices() {
+        if let Err(err) = Self::try_disable_2fa_and_clear_trusted_devices() {
+            log::error!("Failed to atomically disable 2fa and clear trusted devices: {err}");
         }
     }
 
@@ -5357,6 +5399,42 @@ mod tests {
             // Restore permissions for cleanup
             fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700)).ok();
         }
+    }
+
+    #[test]
+    fn test_auth_008_atomic_disable_2fa_and_clear_trusted_devices() {
+        let _guard = lock_config_state_for_test();
+        let _path_guard = ConfigPathTestGuard::new();
+
+        Config::clear_trusted_devices();
+        assert!(Config::get_trusted_devices().is_empty());
+
+        let dev = TrustedDevice {
+            device_id: "trusted-controller-01".to_string(),
+            public_key: Bytes::from_static(&[0x11; 32]),
+            public_key_fingerprint: "fp-01".to_string(),
+            name: "Controller Device 01".to_string(),
+            platform: "linux".to_string(),
+            created_at: crate::get_time(),
+            last_used_at: crate::get_time(),
+            hwid: Bytes::new(),
+        };
+
+        // 1. Seed 2fa, bot, and trusted device
+        Config::set_option("2fa".to_owned(), "dummy-totp-secret".to_owned());
+        Config::set_option("bot".to_owned(), "dummy-bot-token".to_owned());
+        assert!(Config::add_trusted_device(dev).is_ok());
+
+        assert_eq!(Config::get_option("2fa"), "dummy-totp-secret");
+        assert_eq!(Config::get_option("bot"), "dummy-bot-token");
+        assert_eq!(Config::get_trusted_devices().len(), 1);
+
+        // 2. Atomically disable 2FA and clear trusted devices
+        assert!(Config::try_disable_2fa_and_clear_trusted_devices().is_ok());
+
+        assert_eq!(Config::get_option("2fa"), "");
+        assert_eq!(Config::get_option("bot"), "");
+        assert!(Config::get_trusted_devices().is_empty());
     }
 
     #[test]
