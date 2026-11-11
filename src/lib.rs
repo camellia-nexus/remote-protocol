@@ -418,23 +418,26 @@ pub fn is_domain_port_str(id: &str) -> bool {
     endpoint::is_domain_port_str(id)
 }
 
+pub const DEFAULT_LOG_FILTER: &str = "info,reqwest=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn";
+pub const LOG_BUFFER_CAPACITY: usize = 64 * 1024;
+pub const LOG_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+pub const LOG_MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+pub const LOG_MAX_ROTATED_FILES: usize = 14;
+
+static LOGGER_HANDLE: std::sync::Mutex<Option<flexi_logger::LoggerHandle>> =
+    std::sync::Mutex::new(None);
+
 pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHandle> {
     static INIT: std::sync::Once = std::sync::Once::new();
-    #[allow(unused_mut)]
-    let mut logger_holder: Option<flexi_logger::LoggerHandle> = None;
     INIT.call_once(|| {
         #[cfg(debug_assertions)]
         {
             use env_logger::*;
-            init_from_env(Env::default().filter_or(
-                DEFAULT_FILTER_ENV,
-                "info,reqwest=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn",
-            ));
+            init_from_env(Env::default().filter_or(DEFAULT_FILTER_ENV, DEFAULT_LOG_FILTER));
         }
         #[cfg(not(debug_assertions))]
         {
             // https://docs.rs/flexi_logger/latest/flexi_logger/error_info/index.html#write
-            // though async logger more efficient, but it also causes more problems, disable it for now
             let mut path = config::Config::log_path();
             #[cfg(target_os = "android")]
             if !config::Config::get_home().exists() {
@@ -444,28 +447,48 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
                 path.push(_name);
             }
             use flexi_logger::*;
-            if let Ok(x) = Logger::try_with_env_or_str(
-                "debug,reqwest=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn",
-            ) {
-                logger_holder = x
+            if let Ok(x) = Logger::try_with_env_or_str(DEFAULT_LOG_FILTER) {
+                let handle = x
                     .log_to_file(FileSpec::default().directory(path))
                     .write_mode(if _is_async {
-                        WriteMode::Async
+                        WriteMode::AsyncWith {
+                            pool_capa: DEFAULT_POOL_CAPA,
+                            message_capa: DEFAULT_MESSAGE_CAPA,
+                            flush_interval: LOG_FLUSH_INTERVAL,
+                        }
                     } else {
-                        WriteMode::Direct
+                        WriteMode::BufferAndFlushWith(LOG_BUFFER_CAPACITY, LOG_FLUSH_INTERVAL)
                     })
                     .format(opt_format)
                     .rotate(
-                        Criterion::Age(Age::Day),
+                        Criterion::AgeOrSize(Age::Day, LOG_MAX_FILE_SIZE),
                         Naming::Timestamps,
-                        Cleanup::KeepLogFiles(31),
+                        Cleanup::KeepLogFiles(LOG_MAX_ROTATED_FILES),
                     )
                     .start()
                     .ok();
+                if let Some(h) = handle {
+                    if let Ok(mut lock) = LOGGER_HANDLE.lock() {
+                        *lock = Some(h);
+                    }
+                }
             }
         }
     });
-    logger_holder
+    get_logger_handle()
+}
+
+pub fn get_logger_handle() -> Option<flexi_logger::LoggerHandle> {
+    LOGGER_HANDLE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+pub fn flush_log() {
+    if let Some(handle) = get_logger_handle() {
+        handle.flush();
+    }
 }
 
 pub fn time_based_rand() -> u32 {
@@ -659,5 +682,20 @@ mod test {
         ] {
             assert!(!is_valid_custom_id(id), "{}", id);
         }
+    }
+
+    #[test]
+    fn test_log_001_logging_constants_and_contracts() {
+        assert_eq!(
+            DEFAULT_LOG_FILTER,
+            "info,reqwest=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn"
+        );
+        assert_eq!(LOG_BUFFER_CAPACITY, 64 * 1024);
+        assert_eq!(LOG_FLUSH_INTERVAL, std::time::Duration::from_secs(1));
+        assert_eq!(LOG_MAX_FILE_SIZE, 10 * 1024 * 1024);
+        assert_eq!(LOG_MAX_ROTATED_FILES, 14);
+
+        // Safe no-op flush before initialization
+        flush_log();
     }
 }
