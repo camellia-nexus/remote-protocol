@@ -433,7 +433,8 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
         #[cfg(debug_assertions)]
         {
             use env_logger::*;
-            init_from_env(Env::default().filter_or(DEFAULT_FILTER_ENV, DEFAULT_LOG_FILTER));
+            let _ =
+                try_init_from_env(Env::default().filter_or(DEFAULT_FILTER_ENV, DEFAULT_LOG_FILTER));
         }
         #[cfg(not(debug_assertions))]
         {
@@ -468,9 +469,10 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
                     .start()
                     .ok();
                 if let Some(h) = handle {
-                    if let Ok(mut lock) = LOGGER_HANDLE.lock() {
-                        *lock = Some(h);
-                    }
+                    let mut lock = LOGGER_HANDLE
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    *lock = Some(h);
                 }
             }
         }
@@ -696,6 +698,22 @@ mod test {
         assert_eq!(LOG_MAX_ROTATED_FILES, 14);
 
         // Safe no-op flush before initialization
+        flush_log();
+    }
+
+    #[test]
+    fn test_log_001_logger_handle_poison_recovery() {
+        // Intentionally poison LOGGER_HANDLE via a panicking worker thread
+        let _ = std::thread::spawn(|| {
+            let _guard = LOGGER_HANDLE.lock().unwrap();
+            panic!("Intentional panic to poison LOGGER_HANDLE");
+        })
+        .join();
+
+        assert!(LOGGER_HANDLE.is_poisoned());
+
+        // Safe recovery without panicking
+        assert!(get_logger_handle().is_none());
         flush_log();
     }
 }
