@@ -853,6 +853,7 @@ fn write_digest_atomically(
         let result = (|| -> ResultType<()> {
             file.write_all(&content)?;
             file.sync_all()?;
+            drop(file);
             parent.rename(&temp_name, parent, digest_name)?;
             Ok(())
         })();
@@ -1148,13 +1149,25 @@ impl TransferJob {
             .map_err(|_| anyhow!("file modification time is out of range"))?;
         let stream = self
             .data_stream
-            .as_mut()
+            .take()
             .ok_or_else(|| anyhow!("transfer file stream is missing"))?;
         let DataStream::FileStream(file) = stream else {
             bail!("transfer file stream has the wrong type");
         };
         file.sync_all().await?;
-        let file_for_metadata = file.try_clone().await?.into_std().await;
+        let file_for_metadata = file.into_std().await;
+
+        tokio::task::spawn_blocking(move || -> ResultType<()> {
+            filetime::set_file_handle_times(
+                &file_for_metadata,
+                None,
+                Some(filetime::FileTime::from_unix_time(modified_time, 0)),
+            )?;
+            file_for_metadata.sync_all()?;
+            drop(file_for_metadata);
+            Ok(())
+        })
+        .await??;
 
         if !pending.renamed {
             let parent = pending.parent.try_clone()?;
@@ -1180,17 +1193,6 @@ impl TransferJob {
             .try_clone()?;
         tokio::task::spawn_blocking(move || parent.open(".")?.sync_all()).await??;
 
-        tokio::task::spawn_blocking(move || -> ResultType<()> {
-            filetime::set_file_handle_times(
-                &file_for_metadata,
-                None,
-                Some(filetime::FileTime::from_unix_time(modified_time, 0)),
-            )?;
-            file_for_metadata.sync_all()?;
-            Ok(())
-        })
-        .await??;
-
         let pending = self
             .pending_write
             .as_ref()
@@ -1204,7 +1206,6 @@ impl TransferJob {
         })
         .await??;
         self.pending_write.take();
-        self.data_stream.take();
         Ok(())
     }
 
