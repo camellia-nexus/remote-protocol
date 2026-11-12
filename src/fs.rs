@@ -873,6 +873,18 @@ fn remove_file_or_symlink_if_present(parent: &Dir, name: &OsStr) -> ResultType<(
     }
 }
 
+fn sync_parent_directory(parent: &Dir) -> ResultType<()> {
+    #[cfg(unix)]
+    {
+        parent.open(".")?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+    }
+    Ok(())
+}
+
 fn ensure_safe_final_target(parent: &Dir, final_name: &OsStr) -> ResultType<()> {
     match parent.symlink_metadata(final_name) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -1191,7 +1203,7 @@ impl TransferJob {
             .ok_or_else(|| anyhow!("transfer pending state disappeared"))?
             .parent
             .try_clone()?;
-        tokio::task::spawn_blocking(move || parent.open(".")?.sync_all()).await??;
+        tokio::task::spawn_blocking(move || sync_parent_directory(&parent)).await??;
 
         let pending = self
             .pending_write
@@ -1201,7 +1213,7 @@ impl TransferJob {
         let digest_name = pending.digest_name.clone();
         tokio::task::spawn_blocking(move || -> ResultType<()> {
             remove_file_or_symlink_if_present(&parent, &digest_name)?;
-            parent.open(".")?.sync_all()?;
+            sync_parent_directory(&parent)?;
             Ok(())
         })
         .await??;
