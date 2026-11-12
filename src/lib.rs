@@ -230,25 +230,141 @@ pub fn get_version_from_url(url: &str) -> String {
     "".to_owned()
 }
 
-pub fn gen_version() {
-    println!("cargo:rerun-if-changed=Cargo.toml");
-    use std::io::prelude::*;
-    let mut file = File::create("./src/version.rs").unwrap();
-    for line in read_lines("Cargo.toml").unwrap().map_while(Result::ok) {
-        let ab: Vec<&str> = line.split('=').map(|x| x.trim()).collect();
-        if ab.len() == 2 && ab[0] == "version" {
-            file.write_all(format!("pub const VERSION: &str = {};\n", ab[1]).as_bytes())
-                .ok();
-            break;
+/// Resolve a reproducible build date according to BUILD-003 requirements.
+///
+/// Priority order:
+/// 1. `BUILD_DATE` environment variable (must be a non-empty, single-line string).
+/// 2. `SOURCE_DATE_EPOCH` environment variable (must be a valid non-negative integer representing Unix timestamp).
+/// 3. Git commit timestamp of `HEAD` via `git show -s --format=%ct HEAD` or `git log -1 --format=%ct`.
+/// 4. If neither is available:
+///    - In release/CI mode (e.g. `PROFILE == "release"`, `CI == "true"`, or `BUILD_REPRODUCIBLE == "1"`):
+///      fail-closed with an error to prevent non-reproducible releases.
+///    - In development mode: returns a deterministic default `"1970-01-01 00:00 UTC"`.
+pub fn resolve_build_date() -> Result<String, String> {
+    resolve_build_date_from_env(&|key| std::env::var(key).ok())
+}
+
+/// Inner resolver parameterized by an environment lookup function for deterministic testing.
+pub fn resolve_build_date_from_env<F>(lookup_env: &F) -> Result<String, String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    // 1. Explicit BUILD_DATE
+    if let Some(raw) = lookup_env("BUILD_DATE") {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err("BUILD_DATE must not be empty or whitespace-only (BUILD-003)".to_string());
+        }
+        if raw.contains('\n') || raw.contains('\r') {
+            return Err("BUILD_DATE must be a single line (BUILD-003)".to_string());
+        }
+        return Ok(trimmed.to_string());
+    }
+
+    // 2. SOURCE_DATE_EPOCH
+    if let Some(raw) = lookup_env("SOURCE_DATE_EPOCH") {
+        let trimmed = raw.trim();
+        let epoch = trimmed.parse::<i64>().map_err(|e| {
+            format!("SOURCE_DATE_EPOCH must be a valid non-negative integer: {e} (BUILD-003)")
+        })?;
+        if epoch < 0 {
+            return Err(format!(
+                "SOURCE_DATE_EPOCH must be non-negative: {epoch} (BUILD-003)"
+            ));
+        }
+        let dt = chrono::DateTime::from_timestamp(epoch, 0).ok_or_else(|| {
+            format!("SOURCE_DATE_EPOCH value out of range for DateTime: {epoch} (BUILD-003)")
+        })?;
+        return Ok(dt.format("%Y-%m-%d %H:%M UTC").to_string());
+    }
+
+    // 3. Git commit timestamp if available
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["show", "-s", "--format=%ct", "HEAD"])
+        .output()
+    {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Ok(epoch) = stdout.trim().parse::<i64>() {
+                if epoch >= 0 {
+                    if let Some(dt) = chrono::DateTime::from_timestamp(epoch, 0) {
+                        return Ok(dt.format("%Y-%m-%d %H:%M UTC").to_string());
+                    }
+                }
+            }
         }
     }
-    // generate build date
-    let build_date = format!("{}", chrono::Local::now().format("%Y-%m-%d %H:%M"));
-    file.write_all(
-        format!("#[allow(dead_code)]\npub const BUILD_DATE: &str = \"{build_date}\";\n").as_bytes(),
-    )
-    .ok();
-    file.sync_all().ok();
+
+    // 4. Fallback or fail closed
+    let is_release = lookup_env("PROFILE").as_deref() == Some("release")
+        || lookup_env("CI").is_some()
+        || lookup_env("BUILD_REPRODUCIBLE").as_deref() == Some("1");
+
+    if is_release {
+        Err(
+            "Reproducible build failure: SOURCE_DATE_EPOCH or BUILD_DATE must be provided in release/CI mode (BUILD-003)"
+                .to_string(),
+        )
+    } else {
+        Ok("1970-01-01 00:00 UTC".to_string())
+    }
+}
+
+pub fn gen_version() {
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-env-changed=BUILD_DATE");
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+
+    let version = read_cargo_version().unwrap_or_else(|| {
+        std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string())
+    });
+
+    let build_date =
+        resolve_build_date().expect("Failed to resolve reproducible build date (BUILD-003)");
+
+    println!("cargo:rustc-env=CAMELLIA_VERSION={version}");
+    println!("cargo:rustc-env=CAMELLIA_BUILD_DATE={build_date}");
+    println!("cargo:rustc-env=BUILD_DATE={build_date}");
+
+    let version_file_path = std::path::Path::new("./src/version.rs");
+    if let Ok(existing) = std::fs::read_to_string(version_file_path) {
+        if existing.contains("option_env!(\"CAMELLIA_BUILD_DATE\")")
+            || existing.contains("env!(\"CAMELLIA_BUILD_DATE\")")
+        {
+            return;
+        }
+    }
+
+    let target_content = format!(
+        "pub const VERSION: &str = \"{version}\";\n#[allow(dead_code)]\npub const BUILD_DATE: &str = \"{build_date}\";\n"
+    );
+
+    let needs_write = match std::fs::read_to_string(version_file_path) {
+        Ok(existing) => existing != target_content,
+        Err(_) => true,
+    };
+
+    if needs_write {
+        if let Some(parent) = version_file_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = std::fs::File::create(version_file_path) {
+            use std::io::Write;
+            let _ = file.write_all(target_content.as_bytes());
+            let _ = file.sync_all();
+        }
+    }
+}
+
+fn read_cargo_version() -> Option<String> {
+    for line in read_lines("Cargo.toml").ok()?.map_while(Result::ok) {
+        let ab: Vec<&str> = line.split('=').map(|x| x.trim()).collect();
+        if ab.len() == 2 && ab[0] == "version" {
+            let ver = ab[1].trim().trim_matches('"');
+            return Some(ver.to_string());
+        }
+    }
+    None
 }
 
 fn read_lines<P>(filename: P) -> io::Result<io::Lines<io::BufReader<File>>>
@@ -715,5 +831,64 @@ mod test {
         // Safe recovery without panicking
         assert!(get_logger_handle().is_none());
         flush_log();
+    }
+
+    #[test]
+    fn test_build_003_explicit_build_date() {
+        let lookup = |k: &str| match k {
+            "BUILD_DATE" => Some("2026-11-12 00:55 UTC".to_string()),
+            _ => None,
+        };
+        let date = resolve_build_date_from_env(&lookup).unwrap();
+        assert_eq!(date, "2026-11-12 00:55 UTC");
+    }
+
+    #[test]
+    fn test_build_003_reject_multiline_build_date() {
+        let lookup = |k: &str| match k {
+            "BUILD_DATE" => Some("2026-11-12 00:55 UTC\nmalicious injection".to_string()),
+            _ => None,
+        };
+        assert!(resolve_build_date_from_env(&lookup).is_err());
+
+        let lookup_empty = |k: &str| match k {
+            "BUILD_DATE" => Some("   ".to_string()),
+            _ => None,
+        };
+        assert!(resolve_build_date_from_env(&lookup_empty).is_err());
+    }
+
+    #[test]
+    fn test_build_003_source_date_epoch_formatting() {
+        let lookup = |k: &str| match k {
+            "SOURCE_DATE_EPOCH" => Some("1762908900".to_string()), // 2025-11-12 00:55:00 UTC
+            _ => None,
+        };
+        let date = resolve_build_date_from_env(&lookup).unwrap();
+        assert_eq!(date, "2025-11-12 00:55 UTC");
+    }
+
+    #[test]
+    fn test_build_003_reject_invalid_source_date_epoch() {
+        for invalid in ["not-a-number", "-1", "123.456", "123\n456", ""] {
+            let lookup = |k: &str| match k {
+                "SOURCE_DATE_EPOCH" => Some(invalid.to_string()),
+                _ => None,
+            };
+            assert!(
+                resolve_build_date_from_env(&lookup).is_err(),
+                "Expected rejection for '{invalid}'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_003_release_fail_closed_without_source_date() {
+        let lookup_dev = |k: &str| match k {
+            "PROFILE" => Some("debug".to_string()),
+            _ => None,
+        };
+        let dev_date = resolve_build_date_from_env(&lookup_dev).unwrap();
+        assert!(dev_date.ends_with("UTC"));
     }
 }
