@@ -5,6 +5,9 @@ use camellia_remote_protocol::config::{
 };
 use std::collections::HashMap;
 use std::fs;
+use std::sync::Mutex;
+
+static TEST_SERIAL_LOCK: Mutex<()> = Mutex::new(());
 
 struct HardSettingsGuard {
     saved: HashMap<String, String>,
@@ -26,6 +29,7 @@ impl Drop for HardSettingsGuard {
 
 #[test]
 fn test_config002_custom_policy_and_custom_client_semantics() {
+    let _serial_lock = TEST_SERIAL_LOCK.lock().unwrap();
     let _guard = HardSettingsGuard::new();
 
     // 1. Default empty state: all disable policies must be false, custom client must be false
@@ -90,6 +94,7 @@ fn test_config002_custom_policy_and_custom_client_semantics() {
 
 #[test]
 fn test_config003_address_book_and_group_atomic_storage_and_roundtrip() {
+    let _serial_lock = TEST_SERIAL_LOCK.lock().unwrap();
     // 1. Test Ab roundtrip
     Ab::remove();
     let initial_ab = Ab::load();
@@ -168,6 +173,7 @@ fn test_config003_address_book_and_group_atomic_storage_and_roundtrip() {
 
 #[test]
 fn test_config003_transient_failure_preserves_file_without_deletion() {
+    let _serial_lock = TEST_SERIAL_LOCK.lock().unwrap();
     // 1. Address Book: write corrupted data to storage file
     Ab::remove();
     let ab_path = config::Config::path(format!("{}_ab", config::APP_NAME.read().unwrap().clone()));
@@ -218,6 +224,7 @@ fn test_config003_transient_failure_preserves_file_without_deletion() {
 
 #[test]
 fn test_config003_store_binary_durable_atomic_and_permissions() {
+    let _serial_lock = TEST_SERIAL_LOCK.lock().unwrap();
     let temp_dir = std::env::temp_dir().join(format!(
         "camellia_test_config003_{}_{:x}",
         std::process::id(),
