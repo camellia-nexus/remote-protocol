@@ -846,10 +846,7 @@ pub fn load_path<T: serde::Serialize + serde::de::DeserializeOwned + Default + s
     cfg
 }
 
-pub fn store_path_durable<T: serde::Serialize>(
-    path: impl AsRef<Path>,
-    cfg: &T,
-) -> crate::ResultType<()> {
+pub fn store_binary_durable(path: impl AsRef<Path>, data: &[u8]) -> crate::ResultType<()> {
     let path = path.as_ref();
     let parent = path
         .parent()
@@ -868,15 +865,10 @@ pub fn store_path_durable<T: serde::Serialize>(
         let _ = fs::create_dir_all(parent);
     }
 
-    let content = toml::to_string_pretty(cfg)
-        .map_err(|err| anyhow!("Failed to serialize config to TOML: {err}"))?;
-
     let rand_id: u64 = rand::random();
     let temp_file_name = format!(
         ".{}_{}_{:x}.tmp",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("config"),
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("data"),
         std::process::id(),
         rand_id
     );
@@ -906,8 +898,7 @@ pub fn store_path_durable<T: serde::Serialize>(
             let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
         }
 
-        use std::io::Write;
-        file.write_all(content.as_bytes())?;
+        file.write_all(data)?;
         file.sync_all()?;
         drop(file);
 
@@ -924,10 +915,19 @@ pub fn store_path_durable<T: serde::Serialize>(
 
     if let Err(e) = write_res {
         let _ = fs::remove_file(&temp_path);
-        return Err(anyhow!("Failed to durably store config at {:?}: {e}", path));
+        return Err(anyhow!("Failed to durably store data at {:?}: {e}", path));
     }
 
     Ok(())
+}
+
+pub fn store_path_durable<T: serde::Serialize>(
+    path: impl AsRef<Path>,
+    cfg: &T,
+) -> crate::ResultType<()> {
+    let content = toml::to_string_pretty(cfg)
+        .map_err(|err| anyhow!("Failed to serialize config to TOML: {err}"))?;
+    store_binary_durable(path, content.as_bytes())
 }
 
 #[inline]
@@ -3054,43 +3054,54 @@ impl Ab {
         Config::path(filename)
     }
 
-    pub fn store(json: String) {
-        let data = match compress(json.as_bytes()) {
-            Ok(data) => data,
-            Err(err) => {
-                log::error!("failed to compress address book data: {err}");
-                return;
-            }
-        };
+    pub fn try_store(json: &str) -> crate::ResultType<()> {
+        let data = compress(json.as_bytes())
+            .map_err(|err| anyhow!("failed to compress address book data: {err}"))?;
         let max_len = 64 * 1024 * 1024;
         if data.len() > max_len {
             // maxlen of function decompress
-            log::error!("ab data too large, {} > {}", data.len(), max_len);
-            return;
+            bail!("ab data too large, {} > {}", data.len(), max_len);
         }
-        if let Ok(data) = encrypt_local(&data) {
-            if let Ok(mut file) = std::fs::File::create(Self::path()) {
-                file.write_all(&data).ok();
-            }
+        let encrypted = encrypt_local(&data)
+            .map_err(|err| anyhow!("failed to encrypt address book data: {err:?}"))?;
+        store_binary_durable(Self::path(), &encrypted)
+    }
+
+    pub fn store(json: String) {
+        if let Err(err) = Self::try_store(&json) {
+            log::error!("failed to store address book: {err}");
         }
     }
 
+    pub fn try_load() -> crate::ResultType<Option<Ab>> {
+        let path = Self::path();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let mut file = std::fs::File::open(&path)
+            .map_err(|e| anyhow!("failed to open address book file at {:?}: {e}", path))?;
+        let mut data = vec![];
+        file.read_to_end(&mut data)
+            .map_err(|e| anyhow!("failed to read address book: {e}"))?;
+        let decrypted =
+            decrypt_local(&data).map_err(|e| anyhow!("failed to decrypt address book: {e:?}"))?;
+        let decompressed = decompress(&decrypted)
+            .map_err(|e| anyhow!("failed to decompress address book: {e}"))?;
+        let ab: Ab = serde_json::from_str(&String::from_utf8_lossy(&decompressed))
+            .map_err(|e| anyhow!("failed to parse address book JSON: {e}"))?;
+        Ok(Some(ab))
+    }
+
     pub fn load() -> Ab {
-        if let Ok(mut file) = std::fs::File::open(Self::path()) {
-            let mut data = vec![];
-            if file.read_to_end(&mut data).is_ok() {
-                if let Ok(data) = decrypt_local(&data) {
-                    if let Ok(data) = decompress(&data) {
-                        if let Ok(ab) = serde_json::from_str::<Ab>(&String::from_utf8_lossy(&data))
-                        {
-                            return ab;
-                        }
-                    }
-                }
+        match Self::try_load() {
+            Ok(Some(ab)) => ab,
+            Ok(None) => Ab::default(),
+            Err(err) => {
+                // CONFIG-003: Preserve file on disk; do NOT call Self::remove() to prevent data loss on transient error
+                log::error!("failed to load address book: {err}");
+                Ab::default()
             }
-        };
-        Self::remove();
-        Ab::default()
+        }
     }
 
     pub fn remove() {
@@ -3192,43 +3203,54 @@ impl Group {
         Config::path(filename)
     }
 
-    pub fn store(json: String) {
-        let data = match compress(json.as_bytes()) {
-            Ok(data) => data,
-            Err(err) => {
-                log::error!("failed to compress group data: {err}");
-                return;
-            }
-        };
+    pub fn try_store(json: &str) -> crate::ResultType<()> {
+        let data = compress(json.as_bytes())
+            .map_err(|err| anyhow!("failed to compress group data: {err}"))?;
         let max_len = 64 * 1024 * 1024;
         if data.len() > max_len {
             // maxlen of function decompress
-            return;
+            bail!("group data too large, {} > {}", data.len(), max_len);
         }
-        if let Ok(data) = encrypt_local(&data) {
-            if let Ok(mut file) = std::fs::File::create(Self::path()) {
-                file.write_all(&data).ok();
-            }
+        let encrypted =
+            encrypt_local(&data).map_err(|err| anyhow!("failed to encrypt group data: {err:?}"))?;
+        store_binary_durable(Self::path(), &encrypted)
+    }
+
+    pub fn store(json: String) {
+        if let Err(err) = Self::try_store(&json) {
+            log::error!("failed to store group: {err}");
         }
     }
 
+    pub fn try_load() -> crate::ResultType<Option<Self>> {
+        let path = Self::path();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let mut file = std::fs::File::open(&path)
+            .map_err(|e| anyhow!("failed to open group file at {:?}: {e}", path))?;
+        let mut data = vec![];
+        file.read_to_end(&mut data)
+            .map_err(|e| anyhow!("failed to read group file: {e}"))?;
+        let decrypted =
+            decrypt_local(&data).map_err(|e| anyhow!("failed to decrypt group: {e:?}"))?;
+        let decompressed =
+            decompress(&decrypted).map_err(|e| anyhow!("failed to decompress group: {e}"))?;
+        let group: Self = serde_json::from_str(&String::from_utf8_lossy(&decompressed))
+            .map_err(|e| anyhow!("failed to parse group JSON: {e}"))?;
+        Ok(Some(group))
+    }
+
     pub fn load() -> Self {
-        if let Ok(mut file) = std::fs::File::open(Self::path()) {
-            let mut data = vec![];
-            if file.read_to_end(&mut data).is_ok() {
-                if let Ok(data) = decrypt_local(&data) {
-                    if let Ok(data) = decompress(&data) {
-                        if let Ok(group) =
-                            serde_json::from_str::<Self>(&String::from_utf8_lossy(&data))
-                        {
-                            return group;
-                        }
-                    }
-                }
+        match Self::try_load() {
+            Ok(Some(group)) => group,
+            Ok(None) => Self::default(),
+            Err(err) => {
+                // CONFIG-003: Preserve file on disk; do NOT call Self::remove() to prevent data loss on transient error
+                log::error!("failed to load group: {err}");
+                Self::default()
             }
-        };
-        Self::remove();
-        Self::default()
+        }
     }
 
     pub fn remove() {
@@ -3456,17 +3478,27 @@ pub fn is_disable_settings() -> bool {
 
 #[inline]
 pub fn is_disable_ab() -> bool {
-    false
+    is_some_hard_opton("disable-ab")
 }
 
 #[inline]
 pub fn is_disable_account() -> bool {
-    false
+    is_some_hard_opton("disable-account")
+}
+
+#[inline]
+pub fn is_disable_group() -> bool {
+    is_some_hard_opton("disable-group")
 }
 
 #[inline]
 pub fn is_disable_installation() -> bool {
     is_some_hard_opton("disable-installation")
+}
+
+#[inline]
+pub fn is_custom_client() -> bool {
+    !HARD_SETTINGS.read().unwrap().is_empty()
 }
 
 // This function must be kept the same as the Flutter implementation.
