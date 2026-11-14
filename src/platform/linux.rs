@@ -139,7 +139,10 @@ pub fn get_display_server() -> String {
     }
 
     // Check if `loginctl` can be called successfully
-    if run_loginctl(None).is_err() {
+    if !run_loginctl(None)
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
         return DISPLAY_SERVER_X11.to_owned();
     }
 
@@ -406,23 +409,44 @@ pub fn run_cmds_trim_newline(cmds: &str) -> ResultType<String> {
     Ok(out.strip_suffix('\n').unwrap_or(&out).to_string())
 }
 
-fn run_loginctl(args: Option<Vec<&str>>) -> std::io::Result<std::process::Output> {
+pub fn build_loginctl_command(args: Option<&[&str]>) -> std::process::Command {
     if std::env::var("FLATPAK_ID").is_ok() {
-        let mut l_args = CMD_LOGINCTL.to_string();
-        if let Some(a) = args.as_ref() {
-            l_args = format!("{} {}", l_args, a.join(" "));
+        let mut cmd = std::process::Command::new("flatpak-spawn");
+        cmd.arg("--host").arg(CMD_LOGINCTL.as_str());
+        if let Some(a) = args {
+            cmd.args(a);
         }
-        let res = std::process::Command::new("flatpak-spawn")
-            .args(vec![String::from("--host"), l_args])
-            .output();
-        if res.is_ok() {
-            return res;
+        cmd
+    } else {
+        let mut cmd = std::process::Command::new(CMD_LOGINCTL.as_str());
+        if let Some(a) = args {
+            cmd.args(a);
+        }
+        cmd
+    }
+}
+
+fn run_loginctl(args: Option<Vec<&str>>) -> std::io::Result<std::process::Output> {
+    let args_slice = args.as_deref();
+    if std::env::var("FLATPAK_ID").is_ok() {
+        let mut cmd = build_loginctl_command(args_slice);
+        match cmd.output() {
+            Ok(output) if output.status.success() => return Ok(output),
+            Ok(output) => {
+                log::warn!(
+                    "flatpak-spawn --host loginctl failed with exit code {:?}: {}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return Ok(output);
+            }
+            Err(err) => {
+                log::warn!("failed to spawn flatpak-spawn: {}", err);
+                return Err(err);
+            }
         }
     }
-    let mut cmd = std::process::Command::new(CMD_LOGINCTL.as_str());
-    if let Some(a) = args {
-        return cmd.args(a).output();
-    }
+    let mut cmd = build_loginctl_command(args_slice);
     cmd.output()
 }
 
