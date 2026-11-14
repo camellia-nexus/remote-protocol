@@ -39,8 +39,12 @@ jobs:
         with:
           persist-credentials: false
       - name: Toolchain
-        run: rustup toolchain install --no-self-update
+        run: |
+          rustup toolchain install --no-self-update
+          rustup target add aarch64-linux-android
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --version 3.6.4 --locked
       - name: Format
         run: cargo fmt --all -- --check
       - name: Check
@@ -49,6 +53,8 @@ jobs:
         run: cargo clippy --locked --all-targets --all-features
       - name: Test
         run: cargo test --locked --all-targets --all-features
+      - name: Check Android mobile target
+        run: cargo ndk --platform 26 --target arm64-v8a check --locked --all-targets --all-features
 
   macos-quality:
     name: macOS quality
@@ -59,10 +65,14 @@ jobs:
         with:
           persist-credentials: false
       - name: Toolchain
-        run: rustup toolchain install --no-self-update
+        run: |
+          rustup toolchain install --no-self-update
+          rustup target add aarch64-apple-ios
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Check Apple-specific code
         run: cargo check --locked --all-targets --all-features
+      - name: Check iOS mobile target
+        run: cargo check --locked --all-targets --all-features --target aarch64-apple-ios
 
   windows-native:
     name: Windows native verification (${{ matrix.target }})
