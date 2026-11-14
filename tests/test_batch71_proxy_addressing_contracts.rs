@@ -7,7 +7,10 @@
 #![deny(warnings)]
 
 use camellia_remote_protocol::{
-    proxy::{parse_host_and_port, IntoProxyScheme, ProxyError},
+    config::Socks5Server,
+    proxy::{parse_host_and_port, IntoProxyScheme, Proxy, ProxyError},
+    socket_client::test_if_valid_server,
+    tcp::FramedStream,
     AddrMangle, AddressDecodeError,
 };
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -247,4 +250,154 @@ fn test_proto001_addr_mangle_try_decode_optional_addr_contracts() {
         AddrMangle::try_decode_optional_addr(&corrupt_19),
         Err(AddressDecodeError::Malformed)
     );
+}
+
+#[test]
+fn test_res003_socks5_url_parsing_is_non_blocking_and_deferred() {
+    // SOCKS5 URL parsing must succeed instantly without blocking executor threads for DNS resolution
+    let scheme = "socks5://unresolvable.invalid:1080"
+        .into_proxy_scheme()
+        .expect("parsing unresolvable socks5 URL must be non-blocking");
+    assert_eq!(
+        scheme.get_domain().expect("get domain"),
+        "unresolvable.invalid"
+    );
+    assert_eq!(
+        scheme.get_host_and_port().expect("get host port"),
+        "unresolvable.invalid:1080"
+    );
+
+    // Bracketed IPv6 SOCKS5 URL
+    let scheme = "socks5://user:secret@[2001:db8::1]:1080"
+        .into_proxy_scheme()
+        .expect("parsing bracketed IPv6 socks5 URL must succeed");
+    assert_eq!(scheme.get_domain().expect("get domain"), "2001:db8::1");
+    assert_eq!(
+        scheme.get_host_and_port().expect("get host port"),
+        "[2001:db8::1]:1080"
+    );
+
+    // IPv4 SOCKS5 URL with credentials
+    let scheme = "socks5://user:pass@192.0.2.1:1080"
+        .into_proxy_scheme()
+        .expect("parsing IPv4 socks5 URL must succeed");
+    assert_eq!(scheme.get_domain().expect("get domain"), "192.0.2.1");
+    assert_eq!(
+        scheme.get_host_and_port().expect("get host port"),
+        "192.0.2.1:1080"
+    );
+}
+
+#[tokio::test]
+async fn test_res003_resolve_host_addrs_ip_literal_and_multicandidate() {
+    let scheme = "socks5://[::1]:1080"
+        .into_proxy_scheme()
+        .expect("parse scheme");
+    let addrs = scheme
+        .resolve_host_addrs("::1", 1080, std::time::Duration::from_millis(500))
+        .await
+        .expect("resolve ::1 literal");
+    assert_eq!(
+        addrs,
+        vec![SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 1080)]
+    );
+
+    let scheme = "http://127.0.0.1:8080"
+        .into_proxy_scheme()
+        .expect("parse scheme");
+    let addrs = scheme
+        .resolve_host_addrs("127.0.0.1", 8080, std::time::Duration::from_millis(500))
+        .await
+        .expect("resolve 127.0.0.1 literal");
+    assert_eq!(
+        addrs,
+        vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080)]
+    );
+}
+
+#[test]
+fn test_res003_test_if_valid_server_ip_fastpath_and_bounded_timeout() {
+    // Valid IP literals return empty string immediately without DNS resolution
+    assert_eq!(test_if_valid_server("127.0.0.1:21116", false), "");
+    assert_eq!(test_if_valid_server("[::1]:21116", false), "");
+
+    // Unspecified IP literals fail closed
+    let v4_unspec = test_if_valid_server("0.0.0.0:21116", false);
+    assert!(
+        v4_unspec.contains("unspecified"),
+        "0.0.0.0 must be rejected as unspecified, got: {v4_unspec}"
+    );
+
+    let v6_unspec = test_if_valid_server("[::]:21116", false);
+    assert!(
+        v6_unspec.contains("unspecified"),
+        "[::] must be rejected as unspecified, got: {v6_unspec}"
+    );
+
+    // Non-existent domain must fail or time out within 3500ms
+    let start = std::time::Instant::now();
+    let res = test_if_valid_server("nonexistent.unresolvable.invalid:21116", false);
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_millis(3500),
+        "DNS resolution took too long: {elapsed:?}"
+    );
+    assert!(!res.is_empty(), "Unresolvable domain must return an error");
+}
+
+#[tokio::test]
+async fn test_res003_proxy_connect_timeout_enforcement() {
+    // Spawn a dummy TCP listener that accepts connection but never replies
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind dummy listener");
+    let local_port = listener.local_addr().expect("local addr").port();
+
+    let server_task = tokio::spawn(async move {
+        if let Ok((_stream, _)) = listener.accept().await {
+            // Keep connection open without responding
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    });
+
+    let proxy_conf = Socks5Server {
+        proxy: format!("http://127.0.0.1:{local_port}"),
+        username: "".to_string(),
+        password: "".to_string(),
+    };
+    let proxy = Proxy::from_conf(&proxy_conf, Some(150)).expect("proxy from conf");
+
+    let start = std::time::Instant::now();
+    let connect_res = proxy.connect("example.com:80", None).await;
+    let elapsed = start.elapsed();
+
+    assert!(connect_res.is_err(), "stalling proxy must time out");
+    assert!(
+        elapsed < std::time::Duration::from_millis(600),
+        "connect timeout exceeded 600ms: {elapsed:?}"
+    );
+
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn test_res003_framed_stream_connect_loopback() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let port = listener.local_addr().expect("local addr").port();
+
+    let server_task = tokio::spawn(async move {
+        if let Ok((_stream, _)) = listener.accept().await {
+            // Accepted
+        }
+    });
+
+    let target = format!("127.0.0.1:{port}");
+    let framed = FramedStream::new(&target, None, 1000)
+        .await
+        .expect("FramedStream::new should connect to local listener");
+    assert!(framed.local_addr().port() > 0);
+
+    server_task.abort();
 }

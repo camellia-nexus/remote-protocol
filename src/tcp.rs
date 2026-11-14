@@ -130,28 +130,60 @@ impl FramedStream {
         local_addr: Option<SocketAddr>,
         ms_timeout: u64,
     ) -> ResultType<Self> {
-        for remote_addr in lookup_host(&remote_addr).await? {
-            let local = if let Some(addr) = local_addr {
-                addr
-            } else {
-                crate::config::Config::get_any_listen_addr(remote_addr.is_ipv4())
-            };
-            if let Ok(socket) = new_socket(local, true) {
-                if let Ok(Ok(stream)) =
-                    super::timeout(ms_timeout, socket.connect(remote_addr)).await
-                {
-                    stream.set_nodelay(true).ok();
-                    let addr = stream.local_addr()?;
-                    return Ok(Self(
-                        Framed::new(DynTcpStream(Box::new(stream)), BytesCodec::for_session()),
-                        addr,
-                        None,
-                        0,
-                    ));
+        let connect_future = async {
+            let addrs_stream = lookup_host(&remote_addr)
+                .await
+                .context(format!("DNS lookup failed for {remote_addr}"))?;
+            let addrs: Vec<SocketAddr> = addrs_stream.collect();
+            if addrs.is_empty() {
+                bail!("Failed to resolve {remote_addr}: no addresses returned");
+            }
+
+            let mut last_err = None;
+            for candidate in addrs {
+                let local = if let Some(addr) = local_addr {
+                    addr
+                } else {
+                    crate::config::Config::get_any_listen_addr(candidate.is_ipv4())
+                };
+
+                let socket = match new_socket(local, true) {
+                    Ok(s) => s,
+                    Err(err) => {
+                        last_err = Some(anyhow::Error::new(err));
+                        continue;
+                    }
+                };
+
+                match socket.connect(candidate).await {
+                    Ok(stream) => {
+                        stream.set_nodelay(true).ok();
+                        let addr = stream.local_addr()?;
+                        return Ok(Self(
+                            Framed::new(DynTcpStream(Box::new(stream)), BytesCodec::for_session()),
+                            addr,
+                            None,
+                            0,
+                        ));
+                    }
+                    Err(err) => {
+                        last_err = Some(anyhow::Error::new(err));
+                    }
                 }
             }
-        }
-        bail!(format!("Failed to connect to {remote_addr}"));
+
+            if let Some(err) = last_err {
+                bail!("Failed to connect to {remote_addr}: {err}");
+            } else {
+                bail!("Failed to connect to {remote_addr}");
+            }
+        };
+
+        super::timeout(ms_timeout, connect_future)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("Connection to {remote_addr} timed out after {ms_timeout}ms")
+            })?
     }
 
     pub async fn connect<'t, T>(
@@ -273,8 +305,9 @@ pub async fn new_listener<T: ToSocketAddrs>(addr: T, reuse: bool) -> ResultType<
     if !reuse {
         Ok(TcpListener::bind(addr).await?)
     } else {
-        let addr = lookup_host(&addr)
-            .await?
+        let addr = super::timeout(5000, lookup_host(&addr))
+            .await
+            .map_err(|_| anyhow::anyhow!("DNS resolution timed out for listener address"))??
             .next()
             .context("could not resolve to any address")?;
         new_socket(addr, true)?

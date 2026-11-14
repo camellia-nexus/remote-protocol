@@ -10,7 +10,7 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio::net::{ToSocketAddrs, UdpSocket};
 use tokio_socks::{IntoTargetAddr, TargetAddr};
 
-use crate::endpoint::ParsedEndpoint;
+use crate::endpoint::{EndpointHost, ParsedEndpoint};
 
 #[inline]
 pub fn check_port<T: std::string::ToString>(host: T, port: i32) -> String {
@@ -60,14 +60,61 @@ pub fn test_if_valid_server(host: &str, test_with_proxy: bool) -> String {
     let port = ep.port.unwrap_or(crate::config::RENDEZVOUS_PORT as u16);
     let target = format!("{}:{}", ep.raw_host, port);
 
-    use std::net::ToSocketAddrs;
     if test_with_proxy && NetworkType::ProxySocks == Config::get_network_type() {
-        test_if_valid_server_for_proxy_(&target)
-    } else {
-        match target.to_socket_addrs() {
-            Err(err) => err.to_string(),
-            Ok(_) => "".to_owned(),
+        return test_if_valid_server_for_proxy_(&target);
+    }
+
+    // IP literal fast-path (RES-003): immediate validation without DNS or thread spawning
+    match &ep.host {
+        EndpointHost::Ipv4(ip) => {
+            if ip.is_unspecified() {
+                return format!("Invalid server address: unspecified IP {target}");
+            }
+            return "".to_owned();
         }
+        EndpointHost::Ipv6(ip) => {
+            if ip.is_unspecified() {
+                return format!("Invalid server address: unspecified IP {target}");
+            }
+            return "".to_owned();
+        }
+        EndpointHost::Domain(_) => {}
+    }
+
+    // For domain names, bound resolution to 3000ms via worker thread to avoid blocking caller thread
+    let (tx, rx) = std::sync::mpsc::channel();
+    let target_clone = target.clone();
+    if std::thread::Builder::new()
+        .name("dns-test-probe".into())
+        .spawn(move || {
+            use std::net::ToSocketAddrs;
+            let res = target_clone.to_socket_addrs().map(|addrs| {
+                let valid_addrs: Vec<_> = addrs.filter(|a| !a.ip().is_unspecified()).collect();
+                if valid_addrs.is_empty() {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::AddrNotAvailable,
+                        "DNS resolution returned only unspecified addresses",
+                    ))
+                } else {
+                    Ok(())
+                }
+            });
+            let to_send = match res {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            let _ = tx.send(to_send);
+        })
+        .is_err()
+    {
+        return "Failed to spawn DNS resolution thread".to_string();
+    }
+
+    match rx.recv_timeout(std::time::Duration::from_millis(3000)) {
+        Ok(Ok(())) => "".to_owned(),
+        Ok(Err(err_msg)) => err_msg,
+        Err(_) => "DNS resolution timed out after 3000ms".to_owned(),
     }
 }
 
@@ -163,10 +210,14 @@ pub fn is_ipv4(target: &TargetAddr<'_>) -> bool {
 
 #[inline]
 pub async fn query_nip_io(addr: &SocketAddr) -> ResultType<SocketAddr> {
-    tokio::net::lookup_host(format!("{}.nip.io:{}", addr.ip(), addr.port()))
-        .await?
-        .find(|x| x.is_ipv6())
-        .context("Failed to get ipv6 from nip.io")
+    super::timeout(
+        3000,
+        tokio::net::lookup_host(format!("{}.nip.io:{}", addr.ip(), addr.port())),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("DNS resolution timed out for nip.io query"))??
+    .find(|x| x.is_ipv6())
+    .context("Failed to get ipv6 from nip.io")
 }
 
 #[inline]
@@ -185,8 +236,9 @@ async fn test_target(target: &str) -> ResultType<SocketAddr> {
             return Ok(addr);
         }
     }
-    tokio::net::lookup_host(target)
-        .await?
+    super::timeout(2000, tokio::net::lookup_host(target))
+        .await
+        .map_err(|_| anyhow::anyhow!("DNS lookup timed out for {target}"))??
         .next()
         .context(format!("Failed to look up host for {target}"))
 }

@@ -55,8 +55,9 @@ impl FramedSocket {
         reuse: bool,
         buf_size: usize,
     ) -> ResultType<Self> {
-        let addr = lookup_host(&addr)
-            .await?
+        let addr = super::timeout(5000, lookup_host(&addr))
+            .await
+            .map_err(|_| anyhow::anyhow!("DNS resolution timed out for UDP address"))??
             .next()
             .context("could not resolve to any address")?;
         Ok(Self::Direct(UdpFramed::new(

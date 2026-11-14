@@ -211,8 +211,8 @@ pub enum ProxyScheme {
         host: String,
     },
     Socks5 {
-        addr: SocketAddr,
         auth: Option<Auth>,
+        host: String,
         remote_dns: bool,
     },
 }
@@ -286,10 +286,10 @@ impl ProxyScheme {
         }
     }
 
-    fn socks5(addr: SocketAddr) -> Result<Self, ProxyError> {
+    fn socks5(host: &str) -> Result<Self, ProxyError> {
         Ok(ProxyScheme::Socks5 {
-            addr,
             auth: None,
+            host: host.to_string(),
             remote_dns: false,
         })
     }
@@ -322,22 +322,15 @@ impl ProxyScheme {
     fn parse(url: Url) -> Result<Self, ProxyError> {
         use url::Position;
 
-        // Resolve URL to a host and port
-        let to_addr = || {
-            let addrs = url.socket_addrs(|| match url.scheme() {
-                "socks5" => Some(1080),
-                _ => None,
-            })?;
-            addrs
-                .into_iter()
-                .next()
-                .ok_or(ProxyError::UrlParseScheme(url::ParseError::EmptyHost))
-        };
+        if url.host_str().is_none() || url.host_str() == Some("") {
+            return Err(ProxyError::UrlParseScheme(url::ParseError::EmptyHost));
+        }
 
+        let host_and_port = &url[Position::BeforeHost..Position::AfterPort];
         let mut scheme: Self = match url.scheme() {
-            "http" => Self::http(&url[Position::BeforeHost..Position::AfterPort])?,
-            "https" => Self::https(&url[Position::BeforeHost..Position::AfterPort])?,
-            "socks5" => Self::socks5(to_addr()?)?,
+            "http" => Self::http(host_and_port)?,
+            "https" => Self::https(host_and_port)?,
+            "socks5" => Self::socks5(host_and_port)?,
             e => return Err(ProxyError::UrlBadScheme(e.to_string())),
         };
 
@@ -348,29 +341,37 @@ impl ProxyScheme {
 
         Ok(scheme)
     }
+
     pub async fn socket_addrs(&self) -> Result<SocketAddr, ProxyError> {
         log::trace!("Resolving socket address");
-        match self {
-            ProxyScheme::Http { host, .. } => self.resolve_host(host, 80).await,
-            ProxyScheme::Https { host, .. } => self.resolve_host(host, 443).await,
-            ProxyScheme::Socks5 { addr, .. } => Ok(*addr),
-        }
+        let addrs = self
+            .resolve_all_addrs(std::time::Duration::from_secs(5))
+            .await?;
+        addrs
+            .into_iter()
+            .next()
+            .ok_or_else(|| ProxyError::AddressResolutionFailed("No IP addresses found".to_string()))
     }
 
-    async fn resolve_host(&self, host: &str, default_port: u16) -> Result<SocketAddr, ProxyError> {
+    pub async fn resolve_host_addrs(
+        &self,
+        host: &str,
+        default_port: u16,
+        timeout_duration: std::time::Duration,
+    ) -> Result<Vec<SocketAddr>, ProxyError> {
         let (host_str, port) = parse_host_and_port(host, default_port)?;
         // If host_str is already a literal IP address, construct SocketAddr directly without DNS lookup
         if let Ok(ip) = host_str.parse::<std::net::IpAddr>() {
-            return Ok(SocketAddr::new(ip, port));
+            return Ok(vec![SocketAddr::new(ip, port)]);
         }
 
         // Asynchronous DNS resolution bounded by timeout (RES-003)
         let resolve_future = tokio::net::lookup_host((host_str.as_str(), port));
-        let addrs = tokio::time::timeout(std::time::Duration::from_secs(5), resolve_future)
+        let addrs = tokio::time::timeout(timeout_duration, resolve_future)
             .await
             .map_err(|_| {
                 ProxyError::AddressResolutionFailed(format!(
-                    "DNS resolution timed out for {host_str}:{port}"
+                    "DNS resolution timed out after {timeout_duration:?} for {host_str}:{port}"
                 ))
             })?
             .map_err(|e| {
@@ -379,31 +380,47 @@ impl ProxyScheme {
                 ))
             })?;
 
-        let addr = addrs.into_iter().next().ok_or_else(|| {
-            ProxyError::AddressResolutionFailed(format!(
+        let addrs_vec: Vec<SocketAddr> = addrs.collect();
+        if addrs_vec.is_empty() {
+            return Err(ProxyError::AddressResolutionFailed(format!(
                 "No IP addresses found for {host_str}:{port}"
-            ))
-        })?;
-        Ok(addr)
+            )));
+        }
+        Ok(addrs_vec)
+    }
+
+    pub async fn resolve_all_addrs(
+        &self,
+        timeout_duration: std::time::Duration,
+    ) -> Result<Vec<SocketAddr>, ProxyError> {
+        match self {
+            ProxyScheme::Http { host, .. } => {
+                self.resolve_host_addrs(host, 80, timeout_duration).await
+            }
+            ProxyScheme::Https { host, .. } => {
+                self.resolve_host_addrs(host, 443, timeout_duration).await
+            }
+            ProxyScheme::Socks5 { host, .. } => {
+                self.resolve_host_addrs(host, 1080, timeout_duration).await
+            }
+        }
     }
 
     pub fn get_domain(&self) -> Result<String, ProxyError> {
         match self {
-            ProxyScheme::Http { host, .. } | ProxyScheme::Https { host, .. } => {
+            ProxyScheme::Http { host, .. }
+            | ProxyScheme::Https { host, .. }
+            | ProxyScheme::Socks5 { host, .. } => {
                 let (domain, _) = parse_host_and_port(host, 0)?;
                 Ok(domain)
             }
-            ProxyScheme::Socks5 { addr, .. } => match addr {
-                SocketAddr::V4(addr_v4) => Ok(addr_v4.ip().to_string()),
-                SocketAddr::V6(addr_v6) => Ok(addr_v6.ip().to_string()),
-            },
         }
     }
     pub fn get_host_and_port(&self) -> Result<String, ProxyError> {
         match self {
             ProxyScheme::Http { host, .. } => Ok(self.append_default_port(host, 80)),
             ProxyScheme::Https { host, .. } => Ok(self.append_default_port(host, 443)),
-            ProxyScheme::Socks5 { addr, .. } => Ok(format!("{}", addr)),
+            ProxyScheme::Socks5 { host, .. } => Ok(self.append_default_port(host, 1080)),
         }
     }
     fn append_default_port(&self, host: &str, default_port: u16) -> String {
@@ -503,23 +520,27 @@ impl Proxy {
         self.intercept.socket_addrs().await
     }
 
+    pub async fn resolve_host_addrs(
+        &self,
+        host: &str,
+        default_port: u16,
+        timeout_duration: std::time::Duration,
+    ) -> Result<Vec<SocketAddr>, ProxyError> {
+        self.intercept
+            .resolve_host_addrs(host, default_port, timeout_duration)
+            .await
+    }
+
+    pub async fn resolve_all_proxy_addrs(
+        &self,
+        timeout_duration: std::time::Duration,
+    ) -> Result<Vec<SocketAddr>, ProxyError> {
+        self.intercept.resolve_all_addrs(timeout_duration).await
+    }
+
     fn basic_auth(mut self, username: &str, password: &str) -> Proxy {
         self.intercept.set_basic_auth(username, password);
         self
-    }
-
-    async fn new_stream(
-        &self,
-        local: SocketAddr,
-        proxy: SocketAddr,
-    ) -> ResultType<tokio::net::TcpStream> {
-        let stream = super::timeout(
-            self.ms_timeout,
-            crate::tcp::new_socket(local, true)?.connect(proxy),
-        )
-        .await??;
-        stream.set_nodelay(true).ok();
-        Ok(stream)
     }
 
     pub async fn connect<'t, T>(
@@ -554,84 +575,140 @@ impl Proxy {
             ProxyScheme::Socks5 { .. } => None,
         };
 
-        log::trace!("Connect to proxy server");
-        let proxy = self.proxy_addrs().await?;
+        let timeout_duration = std::time::Duration::from_millis(self.ms_timeout);
 
-        let local = if let Some(addr) = local_addr {
-            addr
-        } else {
-            crate::config::Config::get_any_listen_addr(proxy.is_ipv4())
-        };
+        super::timeout(self.ms_timeout, async {
+            let candidates = self.resolve_all_proxy_addrs(timeout_duration).await?;
+            let mut last_error: Option<anyhow::Error> = None;
 
-        let stream = self.new_stream(local, proxy).await?;
-        let addr = stream.local_addr()?;
-
-        match self.intercept {
-            ProxyScheme::Http { .. } => {
-                log::trace!("Connect to remote http proxy server: {}", proxy);
-                let authority = connect_authority
-                    .as_ref()
-                    .ok_or(ProxyError::InvalidTargetAuthority)?;
-                let stream = super::timeout(
-                    self.ms_timeout,
-                    self.http_connect_authority(stream, authority),
-                )
-                .await??;
-                Ok(FramedStream(
-                    Framed::new(DynTcpStream(Box::new(stream)), BytesCodec::for_session()),
-                    addr,
-                    None,
-                    0,
-                ))
-            }
-            ProxyScheme::Https { .. } => {
-                log::trace!("Connect to remote https proxy server: {}", proxy);
-                let authority = connect_authority
-                    .as_ref()
-                    .ok_or(ProxyError::InvalidTargetAuthority)?;
-                // There is already exactly one connected socket. A lazy or
-                // eager "fallback" here is unnecessary and would consume a
-                // second proxy connection before TLS/CONNECT can proceed.
-                let stream = super::timeout(
-                    self.ms_timeout,
-                    self.https_connect_rustls_authority(stream, authority, tls_config),
-                )
-                .await??;
-                Ok(FramedStream(
-                    Framed::new(DynTcpStream(Box::new(stream)), BytesCodec::for_session()),
-                    addr,
-                    None,
-                    0,
-                ))
-            }
-            ProxyScheme::Socks5 { .. } => {
-                log::trace!("Connect to remote socket5 proxy server: {}", proxy);
-                let stream = if let Some(auth) = self.intercept.maybe_auth() {
-                    super::timeout(
-                        self.ms_timeout,
-                        Socks5Stream::connect_with_password_and_socket(
-                            stream,
-                            target_addr,
-                            &auth.user_name,
-                            &auth.password,
-                        ),
-                    )
-                    .await??
+            for proxy_addr in candidates {
+                let local = if let Some(addr) = local_addr {
+                    addr
                 } else {
-                    super::timeout(
-                        self.ms_timeout,
-                        Socks5Stream::connect_with_socket(stream, target_addr),
-                    )
-                    .await??
+                    crate::config::Config::get_any_listen_addr(proxy_addr.is_ipv4())
                 };
-                Ok(FramedStream(
-                    Framed::new(DynTcpStream(Box::new(stream)), BytesCodec::for_session()),
-                    addr,
-                    None,
-                    0,
-                ))
+
+                let socket = match crate::tcp::new_socket(local, true) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        last_error = Some(e.into());
+                        continue;
+                    }
+                };
+
+                let stream = match socket.connect(proxy_addr).await {
+                    Ok(s) => {
+                        s.set_nodelay(true).ok();
+                        s
+                    }
+                    Err(e) => {
+                        last_error = Some(e.into());
+                        continue;
+                    }
+                };
+
+                let addr = match stream.local_addr() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        last_error = Some(e.into());
+                        continue;
+                    }
+                };
+
+                match &self.intercept {
+                    ProxyScheme::Http { .. } => {
+                        log::trace!("Connect to remote http proxy server: {}", proxy_addr);
+                        let authority = connect_authority
+                            .as_ref()
+                            .ok_or(ProxyError::InvalidTargetAuthority)?;
+                        match self.http_connect_authority(stream, authority).await {
+                            Ok(stream) => {
+                                return Ok(FramedStream(
+                                    Framed::new(
+                                        DynTcpStream(Box::new(stream)),
+                                        BytesCodec::for_session(),
+                                    ),
+                                    addr,
+                                    None,
+                                    0,
+                                ));
+                            }
+                            Err(e) => {
+                                last_error = Some(e.into());
+                                continue;
+                            }
+                        }
+                    }
+                    ProxyScheme::Https { .. } => {
+                        log::trace!("Connect to remote https proxy server: {}", proxy_addr);
+                        let authority = connect_authority
+                            .as_ref()
+                            .ok_or(ProxyError::InvalidTargetAuthority)?;
+                        match self
+                            .https_connect_rustls_authority(stream, authority, tls_config.clone())
+                            .await
+                        {
+                            Ok(stream) => {
+                                return Ok(FramedStream(
+                                    Framed::new(
+                                        DynTcpStream(Box::new(stream)),
+                                        BytesCodec::for_session(),
+                                    ),
+                                    addr,
+                                    None,
+                                    0,
+                                ));
+                            }
+                            Err(e) => {
+                                last_error = Some(e.into());
+                                continue;
+                            }
+                        }
+                    }
+                    ProxyScheme::Socks5 { .. } => {
+                        log::trace!("Connect to remote socks5 proxy server: {}", proxy_addr);
+                        let handshake_res = if let Some(auth) = self.intercept.maybe_auth() {
+                            Socks5Stream::connect_with_password_and_socket(
+                                stream,
+                                target_addr.clone(),
+                                &auth.user_name,
+                                &auth.password,
+                            )
+                            .await
+                        } else {
+                            Socks5Stream::connect_with_socket(stream, target_addr.clone()).await
+                        };
+                        match handshake_res {
+                            Ok(stream) => {
+                                return Ok(FramedStream(
+                                    Framed::new(
+                                        DynTcpStream(Box::new(stream)),
+                                        BytesCodec::for_session(),
+                                    ),
+                                    addr,
+                                    None,
+                                    0,
+                                ));
+                            }
+                            Err(e) => {
+                                last_error = Some(anyhow::anyhow!("SOCKS5 handshake failed: {e}"));
+                                continue;
+                            }
+                        }
+                    }
+                }
             }
-        }
+
+            if let Some(err) = last_error {
+                Err(err)
+            } else {
+                Err(ProxyError::AddressResolutionFailed(
+                    "All proxy candidate addresses failed to connect".to_string(),
+                )
+                .into())
+            }
+        })
+        .await?
     }
 
     pub async fn https_connect_rustls<'a, Input>(
