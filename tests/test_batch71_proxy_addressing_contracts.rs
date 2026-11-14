@@ -209,3 +209,42 @@ fn test_proto001_addr_mangle_try_decode_addr_contracts() {
     );
     assert!(AddrMangle::try_decode(&corrupt_19).is_none());
 }
+
+#[test]
+fn test_proto001_addr_mangle_try_decode_optional_addr_contracts() {
+    // Empty bytes must return Ok(None) representing absent optional field
+    let empty_res = AddrMangle::try_decode_optional_addr(&[]);
+    assert_eq!(empty_res, Ok(None));
+
+    // Valid IPv4 returns Ok(Some(SocketAddr))
+    let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 1, 42)), 21116);
+    let enc_v4 = AddrMangle::encode(v4);
+    assert_eq!(AddrMangle::try_decode_optional_addr(&enc_v4), Ok(Some(v4)));
+
+    // Valid IPv6 returns Ok(Some(SocketAddr))
+    let v6 = SocketAddr::new(
+        IpAddr::V6("2001:db8:abcd:ef01::1".parse::<Ipv6Addr>().unwrap()),
+        21118,
+    );
+    let enc_v6 = AddrMangle::encode(v6);
+    assert_eq!(AddrMangle::try_decode_optional_addr(&enc_v6), Ok(Some(v6)));
+
+    // Corrupted inputs must fail-closed with Err(AddressDecodeError::Malformed)
+    let corrupt_1 = [0x42u8];
+    assert_eq!(
+        AddrMangle::try_decode_optional_addr(&corrupt_1),
+        Err(AddressDecodeError::Malformed)
+    );
+
+    let corrupt_17 = [0x55u8; 17];
+    assert_eq!(
+        AddrMangle::try_decode_optional_addr(&corrupt_17),
+        Err(AddressDecodeError::Malformed)
+    );
+
+    let corrupt_19 = [0x55u8; 19];
+    assert_eq!(
+        AddrMangle::try_decode_optional_addr(&corrupt_19),
+        Err(AddressDecodeError::Malformed)
+    );
+}

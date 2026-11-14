@@ -220,6 +220,22 @@ impl AddrMangle {
         Self::try_decode(bytes).ok_or(AddressDecodeError::Malformed)
     }
 
+    /// Try to decode an optional encoded socket address from bytes.
+    /// Returns:
+    /// - `Ok(None)` if `bytes` is empty (field omitted/absent).
+    /// - `Ok(Some(SocketAddr))` if `bytes` decode successfully.
+    /// - `Err(AddressDecodeError::Malformed)` if `bytes` are present but corrupted (PROTO-001).
+    pub fn try_decode_optional_addr(
+        bytes: &[u8],
+    ) -> Result<Option<SocketAddr>, AddressDecodeError> {
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        Self::try_decode(bytes)
+            .map(Some)
+            .ok_or(AddressDecodeError::Malformed)
+    }
+
     #[deprecated(
         note = "AddrMangle::decode silently defaults to [::]:0 on invalid/empty bytes; use try_decode or try_decode_addr instead (PROTO-001)"
     )]
