@@ -118,6 +118,14 @@ pub type ResultType<F, E = anyhow::Error> = anyhow::Result<F, E>;
 
 /// Certain router and firewalls scan the packet and if they
 /// find an IP address belonging to their pool that they use to do the NAT mapping/translation, so here we mangle the ip address
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AddressDecodeError {
+    #[error("Address bytes are empty")]
+    Empty,
+    #[error("Address bytes are malformed or invalid length")]
+    Malformed,
+}
+
 pub struct AddrMangle();
 
 #[inline]
@@ -174,11 +182,14 @@ impl AddrMangle {
         if bytes.len() == 18 {
             let tmp: [u8; 2] = bytes[16..].try_into().ok()?;
             let port = u16::from_le_bytes(tmp);
+            if port == 0 {
+                return None;
+            }
             let tmp: [u8; 16] = bytes[..16].try_into().ok()?;
             let ip = std::net::Ipv6Addr::from(tmp);
             return Some(SocketAddr::new(IpAddr::V6(ip), port));
         }
-        if bytes.is_empty() || bytes.len() > 16 || (bytes.len() < 16 && bytes.last() == Some(&0)) {
+        if bytes.len() < 7 || bytes.len() > 16 || bytes.last() == Some(&0) {
             return None;
         }
         let mut padded = [0u8; 16];
@@ -190,7 +201,7 @@ impl AddrMangle {
             return None;
         }
         let port = (number & 0x1FFFF).checked_sub(tm & 0xFFFF)?;
-        if port > u16::MAX as u128 {
+        if port == 0 || port > u16::MAX as u128 {
             return None;
         }
         Some(SocketAddr::V4(SocketAddrV4::new(
@@ -199,6 +210,19 @@ impl AddrMangle {
         )))
     }
 
+    /// Try to decode an encoded socket address from bytes.
+    /// Returns Ok(SocketAddr) on success, or AddressDecodeError on empty/malformed bytes.
+    /// Does not silently inject `[::]:0` wildcard addresses (PROTO-001).
+    pub fn try_decode_addr(bytes: &[u8]) -> Result<SocketAddr, AddressDecodeError> {
+        if bytes.is_empty() {
+            return Err(AddressDecodeError::Empty);
+        }
+        Self::try_decode(bytes).ok_or(AddressDecodeError::Malformed)
+    }
+
+    #[deprecated(
+        note = "AddrMangle::decode silently defaults to [::]:0 on invalid/empty bytes; use try_decode or try_decode_addr instead (PROTO-001)"
+    )]
     pub fn decode(bytes: &[u8]) -> SocketAddr {
         Self::try_decode(bytes).unwrap_or_else(|| Config::get_any_listen_addr(false))
     }
@@ -666,6 +690,7 @@ mod test {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_mangle() {
         let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 16, 32), 21116));
         assert_eq!(addr, AddrMangle::decode(&AddrMangle::encode(addr)));
@@ -762,6 +787,7 @@ mod test {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_mangle2() {
         let addr = "[::ffff:127.0.0.1]:8080".parse().unwrap();
         let addr_v4 = "127.0.0.1:8080".parse().unwrap();

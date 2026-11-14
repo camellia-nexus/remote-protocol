@@ -1,8 +1,4 @@
-use std::{
-    io::Error as IoError,
-    net::{SocketAddr, ToSocketAddrs},
-    sync::Arc,
-};
+use std::{io::Error as IoError, net::SocketAddr, sync::Arc};
 
 use base64::{engine::general_purpose, Engine};
 use http::uri::Authority;
@@ -221,6 +217,66 @@ pub enum ProxyScheme {
     },
 }
 
+/// Parses host string into (clean_host, port), safely extracting IPv6 bracketed literals,
+/// validating address formats, and rejecting IPv6 zone indices (NET-002).
+pub fn parse_host_and_port(host: &str, default_port: u16) -> Result<(String, u16), ProxyError> {
+    let host = host.trim();
+    if host.is_empty() {
+        return Err(ProxyError::AddressResolutionFailed(
+            "Empty host".to_string(),
+        ));
+    }
+    if host.starts_with('[') {
+        let close_bracket = host.find(']').ok_or_else(|| {
+            ProxyError::AddressResolutionFailed(format!("Mismatched bracket in IPv6 host: {host}"))
+        })?;
+        let ip_str = &host[1..close_bracket];
+        if ip_str.contains('%') {
+            return Err(ProxyError::AddressResolutionFailed(format!(
+                "IPv6 zone index is not permitted in proxy host: {host}"
+            )));
+        }
+        if ip_str.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(ProxyError::AddressResolutionFailed(format!(
+                "Invalid IPv6 address: {ip_str}"
+            )));
+        }
+        let rest = &host[close_bracket + 1..];
+        let port = if let Some(stripped) = rest.strip_prefix(':') {
+            stripped.parse::<u16>().map_err(|_| {
+                ProxyError::AddressResolutionFailed(format!("Invalid port in proxy host: {host}"))
+            })?
+        } else if rest.is_empty() {
+            default_port
+        } else {
+            return Err(ProxyError::AddressResolutionFailed(format!(
+                "Invalid trailing characters after IPv6 bracket: {host}"
+            )));
+        };
+        Ok((ip_str.to_string(), port))
+    } else if host.matches(':').count() > 1 {
+        // Bare IPv6 address without brackets
+        if host.contains('%') {
+            return Err(ProxyError::AddressResolutionFailed(format!(
+                "IPv6 zone index is not permitted in proxy host: {host}"
+            )));
+        }
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(ProxyError::AddressResolutionFailed(format!(
+                "Invalid IPv6 address: {host}"
+            )));
+        }
+        Ok((host.to_string(), default_port))
+    } else if let Some((h, p)) = host.split_once(':') {
+        let port = p.parse::<u16>().map_err(|_| {
+            ProxyError::AddressResolutionFailed(format!("Invalid port in proxy host: {host}"))
+        })?;
+        Ok((h.to_string(), port))
+    } else {
+        Ok((host.to_string(), default_port))
+    }
+}
+
 impl ProxyScheme {
     pub fn maybe_auth(&self) -> Option<&Auth> {
         match self {
@@ -302,25 +358,40 @@ impl ProxyScheme {
     }
 
     async fn resolve_host(&self, host: &str, default_port: u16) -> Result<SocketAddr, ProxyError> {
-        let (host_str, port) = match host.split_once(':') {
-            Some((h, p)) => (h, p.parse::<u16>().ok()),
-            None => (host, None),
-        };
-        let addr = (host_str, port.unwrap_or(default_port))
-            .to_socket_addrs()?
-            .next()
-            .ok_or_else(|| ProxyError::AddressResolutionFailed(host.to_string()))?;
+        let (host_str, port) = parse_host_and_port(host, default_port)?;
+        // If host_str is already a literal IP address, construct SocketAddr directly without DNS lookup
+        if let Ok(ip) = host_str.parse::<std::net::IpAddr>() {
+            return Ok(SocketAddr::new(ip, port));
+        }
+
+        // Asynchronous DNS resolution bounded by timeout (RES-003)
+        let resolve_future = tokio::net::lookup_host((host_str.as_str(), port));
+        let addrs = tokio::time::timeout(std::time::Duration::from_secs(5), resolve_future)
+            .await
+            .map_err(|_| {
+                ProxyError::AddressResolutionFailed(format!(
+                    "DNS resolution timed out for {host_str}:{port}"
+                ))
+            })?
+            .map_err(|e| {
+                ProxyError::AddressResolutionFailed(format!(
+                    "Failed to resolve {host_str}:{port}: {e}"
+                ))
+            })?;
+
+        let addr = addrs.into_iter().next().ok_or_else(|| {
+            ProxyError::AddressResolutionFailed(format!(
+                "No IP addresses found for {host_str}:{port}"
+            ))
+        })?;
         Ok(addr)
     }
 
     pub fn get_domain(&self) -> Result<String, ProxyError> {
         match self {
             ProxyScheme::Http { host, .. } | ProxyScheme::Https { host, .. } => {
-                let domain = host
-                    .split(':')
-                    .next()
-                    .ok_or_else(|| ProxyError::AddressResolutionFailed(host.clone()))?;
-                Ok(domain.to_string())
+                let (domain, _) = parse_host_and_port(host, 0)?;
+                Ok(domain)
             }
             ProxyScheme::Socks5 { addr, .. } => match addr {
                 SocketAddr::V4(addr_v4) => Ok(addr_v4.ip().to_string()),
@@ -336,9 +407,26 @@ impl ProxyScheme {
         }
     }
     fn append_default_port(&self, host: &str, default_port: u16) -> String {
-        if host.contains(':') {
+        let host = host.trim();
+        if host.starts_with('[') {
+            if let Some(close_bracket) = host.find(']') {
+                let rest = &host[close_bracket + 1..];
+                if rest.starts_with(':') {
+                    host.to_string()
+                } else {
+                    format!("{}:{}", host, default_port)
+                }
+            } else {
+                format!("{}:{}", host, default_port)
+            }
+        } else if host.matches(':').count() > 1 {
+            // Bare IPv6 literal without brackets: bracket it and append default port
+            format!("[{}]:{}", host, default_port)
+        } else if host.contains(':') {
+            // Host with existing port (host:port)
             host.to_string()
         } else {
+            // Host or IPv4 without port
             format!("{}:{}", host, default_port)
         }
     }
