@@ -1,10 +1,16 @@
 pub mod compress;
 pub mod crypto;
+pub mod observability;
 pub mod platform;
 pub mod protos;
 pub use bytes;
 use config::Config;
 pub use futures;
+pub use observability::{
+    generate_attempt_id, generate_trace_id, hash_peer_id, is_valid_attempt_id, is_valid_trace_id,
+    mask_ip, mask_socket_addr, structured_opt_format, validate_attempt_id, validate_trace_id,
+    CorrelationContextExt, HotPathSampler, StructuredEvent,
+};
 pub use protobuf;
 pub use protos::message as message_proto;
 pub use protos::rendezvous as rendezvous_proto;
@@ -616,7 +622,7 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
                     } else {
                         WriteMode::BufferAndFlushWith(LOG_BUFFER_CAPACITY, LOG_FLUSH_INTERVAL)
                     })
-                    .format(opt_format)
+                    .format(observability::structured_opt_format)
                     .rotate(
                         Criterion::AgeOrSize(Age::Day, LOG_MAX_FILE_SIZE),
                         Naming::Timestamps,

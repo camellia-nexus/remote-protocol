@@ -17,6 +17,12 @@ enum ConnType {
 
 message RegisterPeerResponse { bool request_pk = 2; }
 
+message CorrelationContext {
+  string trace_id = 1;      // 32-hex lowercase W3C/UUID string
+  string attempt_id = 2;    // 16-hex lowercase attempt/span ID
+  uint64 session_id = 3;    // Optional numeric session sequence
+}
+
 message PunchHoleRequest {
   string id = 1;
   NatType nat_type = 2;
@@ -29,6 +35,7 @@ message PunchHoleRequest {
   int32 upnp_port = 9;
   bytes socket_addr_v6 = 10;
   string switch_code = 11;
+  CorrelationContext correlation = 100;
 }
 
 message ControlPermissions {
@@ -65,6 +72,7 @@ message PunchHole {
   ControlPermissions control_permissions = 8;
   ControlledContext controlled_context = 9;
   bytes rendezvous_token = 10;
+  CorrelationContext correlation = 100;
 }
 
 message TestNatRequest {
@@ -92,6 +100,7 @@ message PunchHoleSent {
   int32 upnp_port = 6;
   bytes socket_addr_v6 = 7;
   bytes rendezvous_token = 8;
+  CorrelationContext correlation = 100;
 }
 
 message RegisterPk {
@@ -137,6 +146,7 @@ message PunchHoleResponse {
   bool is_udp = 9;
   int32 upnp_port = 10;
   bytes socket_addr_v6 = 11;
+  CorrelationContext correlation = 100;
 }
 
 message ConfigUpdate {
@@ -157,6 +167,7 @@ message RequestRelay {
   ControlledContext controlled_context = 10;
   string switch_code = 11;
   bytes rendezvous_token = 12;
+  CorrelationContext correlation = 100;
 }
 
 message RelayResponse {
@@ -173,6 +184,7 @@ message RelayResponse {
   bytes socket_addr_v6 = 10;
   int32 upnp_port = 11;
   bytes rendezvous_token = 12;
+  CorrelationContext correlation = 100;
 }
 
 message SoftwareUpdate { string url = 1; }
@@ -188,6 +200,7 @@ message FetchLocalAddr {
   ControlPermissions control_permissions = 4;
   ControlledContext controlled_context = 5;
   bytes rendezvous_token = 6;
+  CorrelationContext correlation = 100;
 }
 
 message LocalAddr {
@@ -198,6 +211,7 @@ message LocalAddr {
   string version = 5;
   bytes socket_addr_v6 = 6;
   bytes rendezvous_token = 7;
+  CorrelationContext correlation = 100;
 }
 
 message PeerDiscovery {

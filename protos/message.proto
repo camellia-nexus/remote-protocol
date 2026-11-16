@@ -1,6 +1,8 @@
 syntax = "proto3";
 package hbb;
 
+import "rendezvous.proto";
+
 message EncodedVideoFrame {
   bytes data = 1;
   bool key = 2;
@@ -89,6 +91,7 @@ message LoginRequest {
   bytes hwid = 14;
   string avatar = 17;
   uint32 file_transfer_protocol_version = 18;
+  CorrelationContext correlation = 100;
 }
 
 message Terminal {
@@ -160,6 +163,7 @@ message LoginResponse {
   bytes challenge = 4;
   int64 challenge_expires_at = 5;
   string target_id = 6;
+  CorrelationContext correlation = 100;
 }
 
 message TouchScaleUpdate {
