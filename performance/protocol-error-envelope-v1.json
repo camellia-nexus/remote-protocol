@@ -1,0 +1,22 @@
+{
+  "max_relative_mad": 0.15,
+  "metrics": {
+    "encoded_bytes": {
+      "absolute_max": 256,
+      "absolute_min": 1,
+      "direction": "lower",
+      "max_regression_percent": 5,
+      "unit": "bytes"
+    },
+    "roundtrip_ns": {
+      "absolute_max": 50000,
+      "absolute_min": 1,
+      "direction": "lower",
+      "max_regression_percent": 15,
+      "unit": "ns"
+    }
+  },
+  "min_samples": 5,
+  "scenario": "protocol-error-envelope-v1",
+  "schema": "camellia-performance-policy-v1"
+}

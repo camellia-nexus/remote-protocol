@@ -1,0 +1,160 @@
+name: Performance
+
+on:
+  schedule:
+    - cron: "37 3 * * 3"
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: Evidence tier
+        required: true
+        default: scheduled
+        type: choice
+        options:
+          - scheduled
+          - release
+      control_revision:
+        description: Exact 40-character control SHA; required for release
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: remote-protocol-performance-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  compare:
+    name: ${{ github.event_name == 'schedule' && 'Scheduled' || inputs.tier }} A/B
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          path: candidate
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Resolve immutable A/B inputs
+        id: inputs
+        working-directory: candidate
+        shell: bash
+        env:
+          CANDIDATE_REVISION: ${{ github.sha }}
+          CONTROL_INPUT: ${{ inputs.control_revision }}
+          EVENT_NAME: ${{ github.event_name }}
+          TIER_INPUT: ${{ inputs.tier }}
+        run: |
+          set -euo pipefail
+          candidate="$(git rev-parse HEAD)"
+          [[ "$candidate" == "$CANDIDATE_REVISION" && "$candidate" =~ ^[0-9a-f]{40}$ ]]
+          tier="${TIER_INPUT:-scheduled}"
+          [[ "$tier" == scheduled || "$tier" == release ]]
+          if [[ -n "$CONTROL_INPUT" ]]; then
+            [[ "$CONTROL_INPUT" =~ ^[0-9a-f]{40}$ ]]
+            control="$CONTROL_INPUT"
+          else
+            [[ "$tier" == scheduled ]]
+            control="$(git rev-parse HEAD^)"
+          fi
+          [[ "$control" != "$candidate" ]]
+          if [[ "$tier" == release ]]; then
+            iterations=5
+            warmups=0
+            work_seconds=60
+            timeout_seconds=90
+          else
+            iterations=15
+            warmups=1
+            work_seconds=5
+            timeout_seconds=30
+          fi
+          {
+            echo "candidate=$candidate"
+            echo "control=$control"
+            echo "iterations=$iterations"
+            echo "policy=performance/protocol-error-envelope-v1.$tier.json"
+            echo "tier=$tier"
+            echo "timeout_seconds=$timeout_seconds"
+            echo "warmups=$warmups"
+            echo "work_seconds=$work_seconds"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout exact control
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: control
+          persist-credentials: false
+          ref: ${{ steps.inputs.outputs.control }}
+
+      - name: Install exact toolchain
+        run: rustup toolchain install --no-self-update
+        working-directory: candidate
+
+      - name: Validate performance contract
+        run: python3 -m unittest -v tools.test_performance_contract
+        working-directory: candidate
+
+      - name: Build and compare bounded observations
+        env:
+          CAMELLIA_PERFORMANCE_WORK_SECONDS: ${{ steps.inputs.outputs.work_seconds }}
+          CANDIDATE_REVISION: ${{ steps.inputs.outputs.candidate }}
+          CONTROL_REVISION: ${{ steps.inputs.outputs.control }}
+          ITERATIONS: ${{ steps.inputs.outputs.iterations }}
+          TIER: ${{ steps.inputs.outputs.tier }}
+          TIMEOUT_SECONDS: ${{ steps.inputs.outputs.timeout_seconds }}
+          WARMUPS: ${{ steps.inputs.outputs.warmups }}
+          POLICY: ${{ steps.inputs.outputs.policy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -m 0644 \
+            candidate/examples/performance_observation.rs \
+            control/examples/performance_observation.rs
+          CARGO_TARGET_DIR="$RUNNER_TEMP/protocol-performance-target" \
+            cargo build --locked --release --example performance_observation \
+            --manifest-path control/Cargo.toml
+          install -m 0755 \
+            "$RUNNER_TEMP/protocol-performance-target/release/examples/performance_observation" \
+            "$RUNNER_TEMP/protocol-control-observation"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/protocol-performance-target" \
+            cargo build --locked --release --example performance_observation \
+            --manifest-path candidate/Cargo.toml
+          install -m 0755 \
+            "$RUNNER_TEMP/protocol-performance-target/release/examples/performance_observation" \
+            "$RUNNER_TEMP/protocol-candidate-observation"
+          python3 candidate/tools/performance_contract.py collect-pair \
+            --repository remote-protocol \
+            --control-revision "$CONTROL_REVISION" \
+            --candidate-revision "$CANDIDATE_REVISION" \
+            --scenario protocol-error-envelope-v1 \
+            --tier "$TIER" \
+            --runner-class github-ubuntu-24.04-x64 \
+            --toolchain rust-1.97.1 \
+            --iterations "$ITERATIONS" --warmups "$WARMUPS" \
+            --timeout-seconds "$TIMEOUT_SECONDS" \
+            --control-output "$RUNNER_TEMP/protocol-control-performance.json" \
+            --candidate-output "$RUNNER_TEMP/protocol-candidate-performance.json" \
+            -- "$RUNNER_TEMP/protocol-control-observation" \
+            ::: "$RUNNER_TEMP/protocol-candidate-observation"
+          python3 candidate/tools/performance_contract.py compare \
+            "$RUNNER_TEMP/protocol-control-performance.json" \
+            "$RUNNER_TEMP/protocol-candidate-performance.json" \
+            "candidate/$POLICY" \
+            --output "$RUNNER_TEMP/protocol-performance-comparison.json"
+
+      - name: Upload bounded evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: protocol-${{ steps.inputs.outputs.tier }}-${{ steps.inputs.outputs.candidate }}
+          path: |
+            ${{ runner.temp }}/protocol-control-performance.json
+            ${{ runner.temp }}/protocol-candidate-performance.json
+            ${{ runner.temp }}/protocol-performance-comparison.json
+          if-no-files-found: error
+          retention-days: 30

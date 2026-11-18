@@ -110,6 +110,79 @@ jobs:
         shell: pwsh
         run: cargo test --locked --all-targets --all-features --target $env:TARGET
 
+  performance-smoke:
+    name: Performance contract smoke
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: candidate
+          persist-credentials: false
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      - name: Checkout exact control
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: control
+          persist-credentials: false
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || (github.event.before != '0000000000000000000000000000000000000000' && github.event.before || github.sha) }}
+      - name: Install exact toolchain
+        run: rustup toolchain install --no-self-update
+        working-directory: candidate
+      - name: Validate performance contract
+        run: python3 -m unittest -v tools.test_performance_contract
+        working-directory: candidate
+      - name: Build control and candidate observations
+        env:
+          CAMELLIA_PERFORMANCE_WORK_SECONDS: ${{ github.event_name == 'push' && '5' || '' }}
+          CANDIDATE_REVISION: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          CONTROL_REVISION: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || (github.event.before != '0000000000000000000000000000000000000000' && github.event.before || github.sha) }}
+          PERFORMANCE_ITERATIONS: ${{ github.event_name == 'pull_request' && '5' || '15' }}
+          PERFORMANCE_POLICY: ${{ github.event_name == 'pull_request' && 'performance/protocol-error-envelope-v1.json' || 'performance/protocol-error-envelope-v1.scheduled.json' }}
+          PERFORMANCE_TIER: ${{ github.event_name == 'pull_request' && 'pr-smoke' || 'scheduled' }}
+        run: |
+          mkdir -p control/examples
+          install -m 0644 \
+            candidate/examples/performance_observation.rs \
+            control/examples/performance_observation.rs
+          CARGO_TARGET_DIR="$RUNNER_TEMP/control-target" \
+            cargo build --locked --release --example performance_observation \
+            --manifest-path control/Cargo.toml
+          CARGO_TARGET_DIR="$RUNNER_TEMP/candidate-target" \
+            cargo build --locked --release --example performance_observation \
+            --manifest-path candidate/Cargo.toml
+          python3 candidate/tools/performance_contract.py collect-pair \
+            --repository remote-protocol \
+            --control-revision "$CONTROL_REVISION" \
+            --candidate-revision "$CANDIDATE_REVISION" \
+            --scenario protocol-error-envelope-v1 \
+            --tier "$PERFORMANCE_TIER" \
+            --runner-class github-ubuntu-24.04-x64 \
+            --toolchain rust-1.99.1 \
+            --iterations "$PERFORMANCE_ITERATIONS" --warmups 1 --timeout-seconds 30 \
+            --control-output "$RUNNER_TEMP/control-performance.json" \
+            --candidate-output "$RUNNER_TEMP/candidate-performance.json" \
+            -- "$RUNNER_TEMP/control-target/release/examples/performance_observation" \
+            ::: "$RUNNER_TEMP/candidate-target/release/examples/performance_observation"
+          python3 candidate/tools/performance_contract.py compare \
+            "$RUNNER_TEMP/control-performance.json" \
+            "$RUNNER_TEMP/candidate-performance.json" \
+            "candidate/$PERFORMANCE_POLICY" \
+            --output "$RUNNER_TEMP/performance-comparison.json"
+      - name: Upload bounded performance evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: protocol-performance-${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          path: |
+            ${{ runner.temp }}/control-performance.json
+            ${{ runner.temp }}/candidate-performance.json
+            ${{ runner.temp }}/performance-comparison.json
+          if-no-files-found: error
+          retention-days: 14
+
   required:
     name: CI / Required
     if: always()
@@ -118,6 +191,7 @@ jobs:
       - quality
       - macos-quality
       - windows-native
+      - performance-smoke
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -128,8 +202,21 @@ jobs:
           QUALITY_RESULT: ${{ needs.quality.result }}
           MACOS_QUALITY_RESULT: ${{ needs.macos-quality.result }}
           WINDOWS_NATIVE_RESULT: ${{ needs.windows-native.result }}
+          PERFORMANCE_SMOKE_RESULT: ${{ needs.performance-smoke.result }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           [[ "$AUTOMATION_RESULT" == success ]] || { echo "Automation must succeed, got: $AUTOMATION_RESULT" >&2; exit 1; }
           [[ "$QUALITY_RESULT" == success ]] || { echo "Quality must succeed, got: $QUALITY_RESULT" >&2; exit 1; }
           [[ "$MACOS_QUALITY_RESULT" == success ]] || { echo "macOS quality must succeed, got: $MACOS_QUALITY_RESULT" >&2; exit 1; }
           [[ "$WINDOWS_NATIVE_RESULT" == success ]] || { echo "Windows native verification must succeed, got: $WINDOWS_NATIVE_RESULT" >&2; exit 1; }
+          if [[ "$EVENT_NAME" == pull_request || "$EVENT_NAME" == push ]]; then
+            [[ "$PERFORMANCE_SMOKE_RESULT" == success ]] || {
+              echo "Performance smoke must succeed, got: $PERFORMANCE_SMOKE_RESULT" >&2
+              exit 1
+            }
+          else
+            [[ "$PERFORMANCE_SMOKE_RESULT" == skipped ]] || {
+              echo "Performance smoke must be skipped outside pull requests and main pushes, got: $PERFORMANCE_SMOKE_RESULT" >&2
+              exit 1
+            }
+          fi
