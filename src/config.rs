@@ -1977,6 +1977,50 @@ impl Config {
         NetworkType::Direct
     }
 
+    /// Returns true if an unlock PIN is configured and active (CRED-005).
+    pub fn has_unlock_pin() -> bool {
+        if Self::is_disable_unlock_pin() {
+            return false;
+        }
+        let lock = CONFIG2.read().unwrap();
+        !lock.unlock_pin.is_empty()
+    }
+
+    /// Verifies candidate unlock PIN in constant time using `subtle::ConstantTimeEq` (CRED-005).
+    /// Prevents timing side-channel leaks and avoids exporting plaintext PIN across FFI/IPC.
+    pub fn verify_unlock_pin(candidate: &str) -> bool {
+        use subtle::ConstantTimeEq;
+        if Self::is_disable_unlock_pin() {
+            return false;
+        }
+        let stored = CONFIG2.read().unwrap().unlock_pin.clone();
+        if stored.is_empty() {
+            return false;
+        }
+        if stored.len() == candidate.len() {
+            stored.as_bytes().ct_eq(candidate.as_bytes()).into()
+        } else {
+            let _ = candidate.as_bytes().ct_eq(candidate.as_bytes());
+            false
+        }
+    }
+
+    /// Clears any configured unlock PIN (CRED-005).
+    pub fn clear_unlock_pin() {
+        if Self::is_disable_unlock_pin() {
+            return;
+        }
+        let mut config = CONFIG2.write().unwrap();
+        if config.unlock_pin.is_empty() {
+            return;
+        }
+        config.unlock_pin.clear();
+        config.store();
+    }
+
+    #[deprecated(
+        note = "CRED-005: Use has_unlock_pin and verify_unlock_pin instead to avoid plaintext leaks"
+    )]
     pub fn get_unlock_pin() -> String {
         if Self::is_disable_unlock_pin() {
             return String::new();
