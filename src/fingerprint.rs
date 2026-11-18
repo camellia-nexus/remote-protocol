@@ -1,8 +1,7 @@
 use serde_derive::{Deserialize, Serialize};
 use sha2::digest::Update;
 use sha2::{Digest, Sha512};
-use std::collections::HashMap;
-use std::sync::Once;
+use std::sync::OnceLock;
 use sysinfo::System;
 
 const TABLE: [u8; 256] = [
@@ -190,9 +189,7 @@ pub struct FingerprintingInfo {
     addr: String,
 }
 
-static mut FINGERPRINTING_INFO: Option<FingerprintingInfo> = None;
-static INIT: Once = Once::new();
-static mut CACHED_FINGERPRINTS: Option<HashMap<String, Vec<u8>>> = None;
+static FINGERPRINTING_INFO: OnceLock<FingerprintingInfo> = OnceLock::new();
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn mac_fingerprint_address(
@@ -253,15 +250,12 @@ impl FingerprintingInfo {
     }
 }
 
+fn fingerprinting_info() -> &'static FingerprintingInfo {
+    FINGERPRINTING_INFO.get_or_init(FingerprintingInfo::new)
+}
+
 pub fn get_fingerprinting_info() -> FingerprintingInfo {
-    unsafe {
-        INIT.call_once(|| {
-            FINGERPRINTING_INFO = Some(FingerprintingInfo::new());
-            CACHED_FINGERPRINTS = Some(HashMap::new());
-        });
-        #[allow(static_mut_refs)]
-        FINGERPRINTING_INFO.clone().unwrap_or_default()
-    }
+    fingerprinting_info().clone()
 }
 
 pub fn get_fingerprint(only: Option<Vec<String>>, except: Option<Vec<String>>) -> Vec<u8> {
@@ -288,22 +282,7 @@ pub fn get_fingerprint(only: Option<Vec<String>>, except: Option<Vec<String>>) -
         (None, None) => all_parameters,
     };
 
-    let cache_key = parameters.join("");
-
-    unsafe {
-        #[allow(static_mut_refs)]
-        if let Some(cache) = &mut CACHED_FINGERPRINTS {
-            if let Some(fingerprint) = cache.get(&cache_key) {
-                return fingerprint.clone();
-            }
-
-            let fingerprint = calculate_fingerprint(&parameters);
-            cache.insert(cache_key, fingerprint.clone());
-            fingerprint
-        } else {
-            calculate_fingerprint(&parameters)
-        }
-    }
+    calculate_fingerprint(&parameters)
 }
 
 struct Sha512Hasher {
@@ -365,7 +344,7 @@ impl Sha512Hasher {
 }
 
 fn calculate_fingerprint(parameters: &[String]) -> Vec<u8> {
-    let info = get_fingerprinting_info();
+    let info = fingerprinting_info();
 
     let mut hasher = Sha512Hasher::new();
 
@@ -389,6 +368,156 @@ fn calculate_fingerprint(parameters: &[String]) -> Vec<u8> {
         .join("");
     hasher.update(fingerprint_string.as_bytes());
     hasher.finalize()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::get_fingerprint;
+    use std::sync::{Arc, Barrier};
+
+    type FilterCase = (Option<Vec<String>>, Option<Vec<String>>);
+
+    fn parameters(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    fn filter_cases() -> Vec<FilterCase> {
+        vec![
+            (None, None),
+            (Some(Vec::new()), None),
+            (Some(parameters(&["eol"])), None),
+            (Some(parameters(&["arch", "platform"])), None),
+            (Some(parameters(&["eol", "eol"])), None),
+            (Some(parameters(&["unknown"])), None),
+            (None, Some(parameters(&["eol"]))),
+            (None, Some(parameters(&["unknown", "unknown"]))),
+            (
+                Some(parameters(&["id", "addr"])),
+                Some(parameters(&["id", "addr"])),
+            ),
+        ]
+    }
+
+    #[test]
+    fn parameter_lists_do_not_alias_through_a_cache_key() {
+        let empty = get_fingerprint(Some(Vec::new()), None);
+        let known = get_fingerprint(Some(parameters(&["eol", "arch"])), None);
+        assert_ne!(known, empty);
+
+        // Both lists used to produce the cache key `eolarch`, even though the
+        // second list contains only unknown parameters and hashes empty input.
+        let unknown = get_fingerprint(Some(parameters(&["eola", "rch"])), None);
+        assert_eq!(unknown, empty);
+    }
+
+    #[test]
+    fn filters_preserve_order_duplicates_and_precedence() {
+        let all = parameters(&[
+            "eol",
+            "endianness",
+            "brand",
+            "speed_max",
+            "cores",
+            "physical_cores",
+            "mem_total",
+            "platform",
+            "arch",
+            "id",
+            "addr",
+        ]);
+        assert_eq!(
+            get_fingerprint(None, None),
+            get_fingerprint(Some(all), None)
+        );
+
+        let without_eol = parameters(&[
+            "endianness",
+            "brand",
+            "speed_max",
+            "cores",
+            "physical_cores",
+            "mem_total",
+            "platform",
+            "arch",
+            "id",
+            "addr",
+        ]);
+        assert_eq!(
+            get_fingerprint(None, Some(parameters(&["eol"]))),
+            get_fingerprint(Some(without_eol), None)
+        );
+
+        let empty = get_fingerprint(Some(Vec::new()), None);
+        assert_eq!(
+            get_fingerprint(Some(parameters(&["unknown", "unknown"])), None),
+            empty
+        );
+        assert_ne!(
+            get_fingerprint(Some(parameters(&["eol", "eol"])), None),
+            get_fingerprint(Some(parameters(&["eol"])), None)
+        );
+        assert_eq!(
+            get_fingerprint(Some(parameters(&["eol"])), Some(parameters(&["eol"]))),
+            get_fingerprint(Some(parameters(&["eol"])), None)
+        );
+    }
+
+    #[test]
+    fn fingerprints_are_deterministic_across_32_threads() {
+        let cases = filter_cases();
+        let first_access_barrier = Arc::new(Barrier::new(33));
+        let first_results = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(32);
+            for worker in 0..32 {
+                let barrier = Arc::clone(&first_access_barrier);
+                let cases = &cases;
+                handles.push(scope.spawn(move || {
+                    barrier.wait();
+                    let index = worker % cases.len();
+                    let (only, except) = &cases[index];
+                    (index, get_fingerprint(only.clone(), except.clone()))
+                }));
+            }
+            first_access_barrier.wait();
+            handles
+                .into_iter()
+                .map(|handle| match handle.join() {
+                    Ok(result) => result,
+                    Err(payload) => std::panic::resume_unwind(payload),
+                })
+                .collect::<Vec<_>>()
+        });
+
+        let expected: Vec<Vec<u8>> = cases
+            .iter()
+            .map(|(only, except)| get_fingerprint(only.clone(), except.clone()))
+            .collect();
+        for (index, result) in first_results {
+            assert_eq!(result, expected[index]);
+        }
+
+        let barrier = Arc::new(Barrier::new(33));
+
+        std::thread::scope(|scope| {
+            for worker in 0..32 {
+                let barrier = Arc::clone(&barrier);
+                let cases = &cases;
+                let expected = &expected;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for iteration in 0..128 {
+                        let index = (worker + iteration) % cases.len();
+                        let (only, except) = &cases[index];
+                        assert_eq!(
+                            get_fingerprint(only.clone(), except.clone()),
+                            expected[index]
+                        );
+                    }
+                });
+            }
+            barrier.wait();
+        });
+    }
 }
 
 #[cfg(all(test, not(any(target_os = "android", target_os = "ios"))))]

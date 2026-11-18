@@ -41,7 +41,6 @@ zeroize = { version = "1.9.0", features = ["derive"] }
 regex = "1.11"
 tokio-socks = { git = "https://github.com/rustdesk-org/tokio-socks", rev = "bdb9aa3de5bac41602d0742b8ef6bbc6bfebd127" }
 chrono = "0.4"
-backtrace = "0.3"
 libc = "=0.2.189" # sysinfo's iOS network backend requires RTM_IFINFO2 before its macOS-only binding.
 toml = "1.1"
 uuid = { version = "1.16", features = ["v4"] }
