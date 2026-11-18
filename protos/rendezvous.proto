@@ -23,6 +23,64 @@ message CorrelationContext {
   uint64 session_id = 3;    // Optional numeric session sequence
 }
 
+// Versioned, bounded error contract shared by Remote producers and consumers.
+// The wire contract intentionally carries a safe display key rather than
+// human text; details are diagnostic context and must be bounded/redacted by
+// the producer before serialization.
+message ErrorEnvelope {
+  uint32 schema_version = 1;
+  ErrorCategory category = 2;
+  ErrorCode code = 3;
+  bool retryable = 4;
+  string display_key = 5;
+  string details = 6;
+  string correlation_id = 7;
+}
+
+enum ErrorCategory {
+  ERROR_CATEGORY_UNSPECIFIED = 0;
+  AUTHENTICATION = 1;
+  AUTHORIZATION = 2;
+  NETWORK = 3;
+  PROTOCOL = 4;
+  FILE_TRANSFER = 5;
+  PLATFORM = 6;
+  STATE = 7;
+  INTERNAL = 8;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  PASSWORD_REQUIRED = 1;
+  PASSWORD_INVALID = 2;
+  TWO_FACTOR_REQUIRED = 3;
+  TWO_FACTOR_INVALID = 4;
+  NO_PASSWORD_ACCESS = 5;
+  WAYLAND_UNSUPPORTED = 6;
+  DISPLAY_SERVER_UNSUPPORTED = 7;
+  CONNECTION_OFFLINE = 8;
+  CONNECTION_TIMEOUT = 9;
+  CONNECTION_RESET = 10;
+  CONNECTION_CLOSED = 11;
+  PERMISSION_DENIED = 12;
+  CONFLICT = 13;
+  CANCELLED = 14;
+  NOT_FOUND = 15;
+  FILE_OPERATION_FAILED = 16;
+  HTTP_PROXY_FAILED = 17;
+  PROTOCOL_MISMATCH = 18;
+  INTERNAL_FAILURE = 19;
+  DESKTOP_SESSION_NOT_READY = 20;
+  DESKTOP_XSESSION_FAILED = 21;
+  DESKTOP_SESSION_ANOTHER_USER = 22;
+  DESKTOP_XORG_NOT_FOUND = 23;
+  DESKTOP_NOT_FOUND = 24;
+  DESKTOP_SESSION_PASSWORD_REQUIRED = 25;
+  DESKTOP_SESSION_PASSWORD_INVALID = 26;
+  RATE_LIMITED = 27;
+  SERVICE_BUSY = 28;
+}
+
 message PunchHoleRequest {
   string id = 1;
   NatType nat_type = 2;
@@ -258,7 +316,9 @@ message HttpProxyResponse {
   int32 status = 1;
   repeated HeaderEntry headers = 2;
   bytes body = 3;
+  // Deprecated: consumers must use typed_error.
   string error = 4;
+  ErrorEnvelope typed_error = 5;
 }
 
 message RendezvousMessage {

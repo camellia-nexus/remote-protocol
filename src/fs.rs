@@ -24,9 +24,9 @@ use tokio::{
 
 use crate::{
     anyhow::{anyhow, Context},
-    bail, get_version_number,
+    bail, error, get_version_number,
     message_proto::*,
-    ResultType, Stream,
+    ErrorCode, ResultType, Stream,
 };
 // https://doc.rust-lang.org/std/os/windows/fs/trait.MetadataExt.html
 use crate::{
@@ -1938,7 +1938,7 @@ pub fn new_listing_error<T: std::string::ToString>(
 
 fn new_file_error<T: std::string::ToString>(
     id: i32,
-    err: T,
+    _err: T,
     file_num: i32,
     path: String,
     operation: FileErrorOperation,
@@ -1946,10 +1946,12 @@ fn new_file_error<T: std::string::ToString>(
     let mut resp = FileResponse::new();
     resp.set_error(FileTransferError {
         id,
-        error: err.to_string(),
         file_num,
         path,
         operation: operation.into(),
+        typed_error: protobuf::MessageField::some(error::for_code(
+            ErrorCode::FILE_OPERATION_FAILED,
+        )),
         ..Default::default()
     });
     let mut msg_out = Message::new();
@@ -2435,7 +2437,14 @@ mod tests {
         assert_eq!(error.id, 0);
         assert_eq!(error.file_num, -1);
         assert_eq!(error.path, "/requested/path");
-        assert_eq!(error.error, "permission denied");
+        assert!(error.error.is_empty());
+        assert!(crate::error::is_valid(
+            error.typed_error.as_ref().expect("typed error")
+        ));
+        assert_eq!(
+            error.typed_error.code.enum_value(),
+            Ok(ErrorCode::FILE_OPERATION_FAILED)
+        );
         assert_eq!(
             error.operation.enum_value(),
             Ok(FileErrorOperation::ReadEmptyDirs)

@@ -156,8 +156,11 @@ message WindowsSession {
 
 message LoginResponse {
   oneof union {
+    // Deprecated: consumers must use typed_error. Kept only so malformed or
+    // pre-contract peers can be rejected explicitly at the boundary.
     string error = 1;
     PeerInfo peer_info = 2;
+    ErrorEnvelope typed_error = 7;
   }
   bool enable_trusted_devices = 3;
   bytes challenge = 4;
@@ -469,12 +472,14 @@ message FileTransferBlock {
 
 message FileTransferError {
   int32 id = 1;
+  // Deprecated: consumers must use typed_error.
   string error = 2;
   sint32 file_num = 3;
   // Non-transfer file operations have no job id. Preserve their request path
   // and operation so the caller can fail the matching pending UI request.
   string path = 4;
   FileErrorOperation operation = 5;
+  ErrorEnvelope typed_error = 6;
 }
 
 enum FileErrorOperation {
@@ -853,6 +858,7 @@ message Misc {
     PermissionInfo permission_info = 6;
     OptionMessage option = 7;
     AudioFormat audio_format = 8;
+    // Deprecated: consumers must use close_error.
     string close_reason = 9;
     bool refresh_video = 10;
     bool video_received = 12;
@@ -883,6 +889,7 @@ message Misc {
     DisplayResolution change_display_resolution = 36;
     MessageQuery message_query = 37;
     int32 follow_current_display = 38;
+    ErrorEnvelope close_error = 39;
   }
 }
 
@@ -961,7 +968,9 @@ message TerminalClosed {
 
 message TerminalError {
   int32 terminal_id = 1;
+  // Deprecated: consumers must use typed_error.
   string message = 2;
+  ErrorEnvelope typed_error = 3;
 }
 
 message TerminalResponse {

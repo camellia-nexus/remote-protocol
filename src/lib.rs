@@ -1,5 +1,6 @@
 pub mod compress;
 pub mod crypto;
+pub mod error;
 pub mod observability;
 pub mod platform;
 pub mod protos;
@@ -14,6 +15,7 @@ pub use observability::{
 pub use protobuf;
 pub use protos::message as message_proto;
 pub use protos::rendezvous as rendezvous_proto;
+pub use rendezvous_proto::{ErrorCategory, ErrorCode, ErrorEnvelope};
 use std::{
     fs::File,
     io::{self, BufRead},
