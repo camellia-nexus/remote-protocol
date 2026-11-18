@@ -112,7 +112,7 @@ jobs:
 
   performance-smoke:
     name: Performance contract smoke
-    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -209,7 +209,7 @@ jobs:
           [[ "$QUALITY_RESULT" == success ]] || { echo "Quality must succeed, got: $QUALITY_RESULT" >&2; exit 1; }
           [[ "$MACOS_QUALITY_RESULT" == success ]] || { echo "macOS quality must succeed, got: $MACOS_QUALITY_RESULT" >&2; exit 1; }
           [[ "$WINDOWS_NATIVE_RESULT" == success ]] || { echo "Windows native verification must succeed, got: $WINDOWS_NATIVE_RESULT" >&2; exit 1; }
-          if [[ "$EVENT_NAME" == pull_request || "$EVENT_NAME" == push ]]; then
+          if [[ "$EVENT_NAME" == pull_request || ("$EVENT_NAME" == push && "${{ github.ref }}" == "refs/heads/main") ]]; then
             [[ "$PERFORMANCE_SMOKE_RESULT" == success ]] || {
               echo "Performance smoke must succeed, got: $PERFORMANCE_SMOKE_RESULT" >&2
               exit 1
