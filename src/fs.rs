@@ -1923,7 +1923,7 @@ pub fn new_error<T: std::string::ToString>(id: i32, err: T, file_num: i32) -> Me
         err,
         file_num,
         String::new(),
-        FileErrorOperation::Transfer,
+        FileErrorOperation::FILE_ERROR_OP_TRANSFER,
     )
 }
 
@@ -2424,7 +2424,7 @@ mod tests {
         let message = new_listing_error(
             "/requested/path".to_owned(),
             "permission denied",
-            FileErrorOperation::ReadEmptyDirs,
+            FileErrorOperation::FILE_ERROR_OP_READ_EMPTY_DIRS,
         );
         let message = Message::parse_from_bytes(
             &message
@@ -2447,7 +2447,7 @@ mod tests {
         );
         assert_eq!(
             error.operation.enum_value(),
-            Ok(FileErrorOperation::ReadEmptyDirs)
+            Ok(FileErrorOperation::FILE_ERROR_OP_READ_EMPTY_DIRS)
         );
     }
 

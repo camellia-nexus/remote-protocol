@@ -150,41 +150,61 @@ pub fn is_valid_for(error: &ErrorEnvelope, context: ErrorContext) -> bool {
 pub fn for_code(code: ErrorCode) -> ErrorEnvelope {
     use ErrorCategory::*;
     let (category, retryable, display_key) = match code {
-        ErrorCode::PASSWORD_REQUIRED => (AUTHENTICATION, true, "password_required"),
-        ErrorCode::PASSWORD_INVALID => (AUTHENTICATION, true, "password_invalid"),
-        ErrorCode::TWO_FACTOR_REQUIRED => (AUTHENTICATION, true, "two_factor_required"),
-        ErrorCode::TWO_FACTOR_INVALID => (AUTHENTICATION, true, "two_factor_invalid"),
-        ErrorCode::NO_PASSWORD_ACCESS => (AUTHORIZATION, true, "no_password_access"),
-        ErrorCode::WAYLAND_UNSUPPORTED => (PLATFORM, true, "wayland_unsupported"),
-        ErrorCode::DISPLAY_SERVER_UNSUPPORTED => (PLATFORM, true, "display_server_unsupported"),
-        ErrorCode::CONNECTION_OFFLINE => (NETWORK, false, "connection_offline"),
-        ErrorCode::CONNECTION_TIMEOUT => (NETWORK, true, "connection_timeout"),
-        ErrorCode::CONNECTION_RESET => (NETWORK, true, "connection_reset"),
-        ErrorCode::CONNECTION_CLOSED => (NETWORK, false, "connection_closed"),
-        ErrorCode::PERMISSION_DENIED => (AUTHORIZATION, false, "permission_denied"),
-        ErrorCode::CONFLICT => (STATE, false, "conflict"),
-        ErrorCode::CANCELLED => (STATE, false, "cancelled"),
-        ErrorCode::NOT_FOUND => (STATE, false, "not_found"),
-        ErrorCode::FILE_OPERATION_FAILED => (FILE_TRANSFER, false, "file_operation_failed"),
-        ErrorCode::HTTP_PROXY_FAILED => (NETWORK, true, "http_proxy_failed"),
-        ErrorCode::PROTOCOL_MISMATCH => (PROTOCOL, false, "protocol_mismatch"),
-        ErrorCode::DESKTOP_SESSION_NOT_READY => (PLATFORM, true, "desktop_session_not_ready"),
-        ErrorCode::DESKTOP_XSESSION_FAILED => (PLATFORM, true, "desktop_xsession_failed"),
-        ErrorCode::DESKTOP_SESSION_ANOTHER_USER => {
-            (PLATFORM, false, "desktop_session_another_user")
+        ErrorCode::PASSWORD_REQUIRED => (ERROR_CATEGORY_AUTHENTICATION, true, "password_required"),
+        ErrorCode::PASSWORD_INVALID => (ERROR_CATEGORY_AUTHENTICATION, true, "password_invalid"),
+        ErrorCode::TWO_FACTOR_REQUIRED => {
+            (ERROR_CATEGORY_AUTHENTICATION, true, "two_factor_required")
         }
-        ErrorCode::DESKTOP_XORG_NOT_FOUND => (PLATFORM, true, "desktop_xorg_not_found"),
-        ErrorCode::DESKTOP_NOT_FOUND => (PLATFORM, true, "desktop_no_desktop"),
-        ErrorCode::DESKTOP_SESSION_PASSWORD_REQUIRED => {
-            (AUTHENTICATION, true, "desktop_session_password_required")
+        ErrorCode::TWO_FACTOR_INVALID => {
+            (ERROR_CATEGORY_AUTHENTICATION, true, "two_factor_invalid")
         }
-        ErrorCode::DESKTOP_SESSION_PASSWORD_INVALID => {
-            (AUTHENTICATION, true, "desktop_session_password_invalid")
+        ErrorCode::NO_PASSWORD_ACCESS => (ERROR_CATEGORY_AUTHORIZATION, true, "no_password_access"),
+        ErrorCode::WAYLAND_UNSUPPORTED => (ERROR_CATEGORY_PLATFORM, true, "wayland_unsupported"),
+        ErrorCode::DISPLAY_SERVER_UNSUPPORTED => {
+            (ERROR_CATEGORY_PLATFORM, true, "display_server_unsupported")
         }
-        ErrorCode::RATE_LIMITED => (NETWORK, true, "rate_limited"),
-        ErrorCode::SERVICE_BUSY => (NETWORK, true, "service_busy"),
+        ErrorCode::CONNECTION_OFFLINE => (ERROR_CATEGORY_NETWORK, false, "connection_offline"),
+        ErrorCode::CONNECTION_TIMEOUT => (ERROR_CATEGORY_NETWORK, true, "connection_timeout"),
+        ErrorCode::CONNECTION_RESET => (ERROR_CATEGORY_NETWORK, true, "connection_reset"),
+        ErrorCode::CONNECTION_CLOSED => (ERROR_CATEGORY_NETWORK, false, "connection_closed"),
+        ErrorCode::PERMISSION_DENIED => (ERROR_CATEGORY_AUTHORIZATION, false, "permission_denied"),
+        ErrorCode::CONFLICT => (ERROR_CATEGORY_STATE, false, "conflict"),
+        ErrorCode::CANCELLED => (ERROR_CATEGORY_STATE, false, "cancelled"),
+        ErrorCode::NOT_FOUND => (ERROR_CATEGORY_STATE, false, "not_found"),
+        ErrorCode::FILE_OPERATION_FAILED => {
+            (ERROR_CATEGORY_FILE_TRANSFER, false, "file_operation_failed")
+        }
+        ErrorCode::HTTP_PROXY_FAILED => (ERROR_CATEGORY_NETWORK, true, "http_proxy_failed"),
+        ErrorCode::PROTOCOL_MISMATCH => (ERROR_CATEGORY_PROTOCOL, false, "protocol_mismatch"),
+        ErrorCode::DESKTOP_SESSION_NOT_READY => {
+            (ERROR_CATEGORY_PLATFORM, true, "desktop_session_not_ready")
+        }
+        ErrorCode::DESKTOP_XSESSION_FAILED => {
+            (ERROR_CATEGORY_PLATFORM, true, "desktop_xsession_failed")
+        }
+        ErrorCode::DESKTOP_SESSION_ANOTHER_USER => (
+            ERROR_CATEGORY_PLATFORM,
+            false,
+            "desktop_session_another_user",
+        ),
+        ErrorCode::DESKTOP_XORG_NOT_FOUND => {
+            (ERROR_CATEGORY_PLATFORM, true, "desktop_xorg_not_found")
+        }
+        ErrorCode::DESKTOP_NOT_FOUND => (ERROR_CATEGORY_PLATFORM, true, "desktop_no_desktop"),
+        ErrorCode::DESKTOP_SESSION_PASSWORD_REQUIRED => (
+            ERROR_CATEGORY_AUTHENTICATION,
+            true,
+            "desktop_session_password_required",
+        ),
+        ErrorCode::DESKTOP_SESSION_PASSWORD_INVALID => (
+            ERROR_CATEGORY_AUTHENTICATION,
+            true,
+            "desktop_session_password_invalid",
+        ),
+        ErrorCode::RATE_LIMITED => (ERROR_CATEGORY_NETWORK, true, "rate_limited"),
+        ErrorCode::SERVICE_BUSY => (ERROR_CATEGORY_NETWORK, true, "service_busy"),
         ErrorCode::INTERNAL_FAILURE | ErrorCode::ERROR_CODE_UNSPECIFIED => {
-            (INTERNAL, false, "internal_failure")
+            (ERROR_CATEGORY_INTERNAL, false, "internal_failure")
         }
     };
     envelope(category, code, retryable, display_key)
@@ -201,7 +221,7 @@ mod tests {
         let error = with_correlation_id(
             with_details(
                 envelope(
-                    ErrorCategory::NETWORK,
+                    ErrorCategory::ERROR_CATEGORY_NETWORK,
                     ErrorCode::CONNECTION_TIMEOUT,
                     true,
                     "connection_timeout",
@@ -241,7 +261,7 @@ mod tests {
         assert!(!is_valid(&error));
 
         let mut error = for_code(ErrorCode::PASSWORD_INVALID);
-        error.category = ErrorCategory::NETWORK.into();
+        error.category = ErrorCategory::ERROR_CATEGORY_NETWORK.into();
         assert!(!is_valid(&error));
 
         let mut error = for_code(ErrorCode::PASSWORD_INVALID);

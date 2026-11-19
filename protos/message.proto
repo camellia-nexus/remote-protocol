@@ -483,9 +483,9 @@ message FileTransferError {
 }
 
 enum FileErrorOperation {
-  Transfer = 0;
-  ReadDir = 1;
-  ReadEmptyDirs = 2;
+  FILE_ERROR_OP_TRANSFER = 0;
+  FILE_ERROR_OP_READ_DIR = 1;
+  FILE_ERROR_OP_READ_EMPTY_DIRS = 2;
 }
 
 message FileTransferSendRequest {
